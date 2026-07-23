@@ -1,0 +1,21 @@
+[package]
+name = "bedrock-parser"
+description = "Project Bedrock parser system — see docs/PRD.md for scope."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bedrock-settings = { workspace = true }
+dirs = { workspace = true }
+flate2 = { workspace = true }
+fastnbt = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+bedrock-leveldb = { workspace = true }
+bytes = { workspace = true }
+image = { workspace = true }
+serde_json.workspace = true
+zip = { workspace = true }
+ureq = { workspace = true }
+chunkforge-core = { workspace = true }

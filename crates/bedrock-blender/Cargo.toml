@@ -1,0 +1,8 @@
+[package]
+name = "bedrock-blender"
+description = "Project Bedrock blender system — see docs/PRD.md for scope."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

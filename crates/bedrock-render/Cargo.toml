@@ -1,0 +1,13 @@
+[package]
+name = "bedrock-render"
+description = "Project Bedrock GPU viewport — wgpu rendering of parsed world data. Never exports, never parses."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bedrock-parser = { workspace = true }
+bytemuck = { workspace = true }
+egui = { workspace = true }
+egui-wgpu = { workspace = true }
+tracing = { workspace = true }
