@@ -1,0 +1,28 @@
+[package]
+name = "bedrock-app"
+description = "Project Bedrock — modern Minecraft world exporter for Blender (application entry point)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[[bin]]
+name = "project-bedrock"
+path = "src/main.rs"
+
+[dependencies]
+bedrock-export = { workspace = true }
+bedrock-parser = { workspace = true }
+bedrock-ui = { workspace = true }
+bedrock-render = { workspace = true }
+bedrock-settings = { workspace = true }
+dirs = { workspace = true }
+eframe = { workspace = true }
+egui = { workspace = true }
+egui_dock = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+image = { workspace = true }
+
+[build-dependencies]
+embed-resource = { workspace = true }

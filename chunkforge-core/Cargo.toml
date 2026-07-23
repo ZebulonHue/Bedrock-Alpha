@@ -1,0 +1,14 @@
+[package]
+name = "chunkforge-core"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.74"
+description = "Minecraft Java Edition Anvil region parser (1.18+): decodes chunks, culls interior blocks, returns exterior blocks grouped by type."
+license = "MIT"
+
+[dependencies]
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+byteorder = "1"
+
+[profile.release]
+opt-level = 3

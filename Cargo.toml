@@ -1,0 +1,65 @@
+[workspace]
+resolver = "2"
+members = ["crates/*", "chunkforge-core"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+# Every crate in the workspace shares these exact dependency versions.
+# Member crates reference them with `{ workspace = true }`.
+[workspace.dependencies]
+# --- Project Bedrock crates ---
+bedrock-app = { path = "crates/bedrock-app" }
+chunkforge-core = { path = "chunkforge-core" }
+bedrock-ui = { path = "crates/bedrock-ui" }
+bedrock-render = { path = "crates/bedrock-render" }
+bedrock-settings = { path = "crates/bedrock-settings" }
+bedrock-parser = { path = "crates/bedrock-parser" }
+bedrock-export = { path = "crates/bedrock-export" }
+bedrock-blender = { path = "crates/bedrock-blender" }
+bedrock-cache = { path = "crates/bedrock-cache" }
+
+# --- egui ecosystem ---
+# These four MUST be upgraded together: egui_dock and egui_wgpu are compiled
+# against a specific egui/eframe version. After any bump, verify with
+# `cargo tree -d` that only one egui version is present.
+eframe = { version = "0.35", default-features = false, features = [
+    "default_fonts",
+    "persistence",
+    "wgpu",
+] }
+egui = "0.35"
+egui-wgpu = "0.35"
+egui_dock = { version = "0.20", features = ["serde"] }
+
+# --- Serialization ---
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+
+# --- Platform / utility ---
+bytemuck = "1"
+bytes = "1"
+byteorder = "1"
+dirs = "6"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+rfd = "0.15"
+embed-resource = "3"
+
+# --- Minecraft world data (Phase 2-3) ---
+flate2 = "1"
+fastnbt = "2"
+# Bedrock Edition worlds are LevelDB databases (zlib/snappy tables).
+# Justification: a correct SSTable/WAL reader is a multi-week project;
+# bedrock-leveldb is purpose-built for Minecraft's LevelDB fork.
+bedrock-leveldb = { version = "0.3.1", default-features = false, features = ["zlib", "snappy"] }
+# Vanilla block textures come from the official Minecraft client jar
+# (downloaded once from Mojang's piston CDN, then cached locally).
+# Justification: zip reads the jar without extracting it; ureq is a small
+# blocking HTTPS client used only for that one-time download.
+zip = { version = "2", default-features = false, features = ["deflate"] }
+ureq = { version = "2", features = ["json"] }

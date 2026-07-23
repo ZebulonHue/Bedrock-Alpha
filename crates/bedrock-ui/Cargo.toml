@@ -1,0 +1,19 @@
+[package]
+name = "bedrock-ui"
+description = "Project Bedrock UI layer — dockable panels, theme, log view. No business logic."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bedrock-export = { workspace = true }
+bedrock-parser = { workspace = true }
+bedrock-render = { workspace = true }
+bedrock-settings = { workspace = true }
+egui = { workspace = true }
+egui_dock = { workspace = true }
+image = { workspace = true }
+rfd = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
