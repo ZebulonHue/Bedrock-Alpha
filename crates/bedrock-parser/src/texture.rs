@@ -143,6 +143,11 @@ pub struct FaceAwareTileSet {
     pub atlas: TileSet,
     /// Per-block, per-face UV rect. Key: `(namespaced_block_name, face_dir)`.
     pub(crate) face_uvs: HashMap<(String, FaceDir), [f32; 4]>,
+    /// UV rect per *texture name* (`"bush"`, `"oak_log_top"`).
+    ///
+    /// Vanilla block models name a texture per face rather than relying on a
+    /// block's face order, so model-driven geometry needs this direct lookup.
+    pub(crate) texture_uvs: HashMap<String, [f32; 4]>,
 }
 
 impl FaceAwareTileSet {
@@ -218,23 +223,46 @@ impl FaceAwareTileSet {
             face_uvs.insert((block_name.clone(), 5), tex_uv(&ft.north));
         }
 
-        Self { atlas, face_uvs }
+        let texture_uvs = tex_ids
+            .keys()
+            .map(|name| (name.clone(), tex_uv(name)))
+            .collect();
+        Self { atlas, face_uvs, texture_uvs }
     }
 
     /// UV rect for a specific block face.
     ///
-    /// Falls back to `(0,0,1,1)` for unknown blocks or face directions.
+    /// Falls back to `(0,0,1,1)` (the whole atlas stretched across the
+    /// face) for unknown blocks or face directions. This should never
+    /// happen for a `block` key that came from the same
+    /// `Chunk::texture_keys()` call used to build this tileset — if it
+    /// does, something upstream (name resolution, key construction) is
+    /// broken, so it's logged rather than failing silently.
     pub fn face_uv(&self, block: &str, face: FaceDir) -> [f32; 4] {
-        self.face_uvs
-            .get(&(block.to_owned(), face))
-            .copied()
-            .unwrap_or([0.0, 0.0, 1.0, 1.0])
+        match self.face_uvs.get(&(block.to_owned(), face)) {
+            Some(uv) => *uv,
+            None => {
+                tracing::warn!(
+                    "no UV entry for block={block:?} face={face}; falling back to full-atlas UV \
+                     (texture will look wrong for this face)"
+                );
+                [0.0, 0.0, 1.0, 1.0]
+            }
+        }
     }
 
     /// UV rect for a specific texture name.
     pub fn tile_uv(&self, texture: &str) -> [f32; 4] {
+        if let Some(uv) = self.texture_uvs.get(texture) {
+            return *uv;
+        }
         let idx = self.atlas.ids.get(texture).copied().unwrap_or(0) as usize;
         uv_rect_for_index(idx, self.atlas.width, self.atlas.height)
+    }
+
+    /// True when `texture` has a real tile in this atlas.
+    pub fn has_texture(&self, texture: &str) -> bool {
+        self.texture_uvs.contains_key(texture) || self.atlas.ids.contains_key(texture)
     }
 }
 
@@ -342,10 +370,10 @@ fn decode_tile(png_bytes: &[u8]) -> Option<[u8; TILE * TILE * 4]> {
 /// Source: Minecraft grass colormap at temperature=0.8, downfall=0.4 (plains).
 /// Confirmed against MCprep data (linear [0.227, 0.615, 0.089] → sRGB #83CE54
 /// rounds to the canonical wiki value #79C05A).
-const PLAINS_GRASS: [u8; 3] = [0x79, 0xC0, 0x5A];
+pub(crate) const PLAINS_GRASS: [u8; 3] = [0x79, 0xC0, 0x5A];
 /// Plains-biome foliage green.
 /// Source: Minecraft foliage colormap at temperature=0.8, downfall=0.4.
-const PLAINS_FOLIAGE: [u8; 3] = [0x59, 0xAE, 0x30];
+pub(crate) const PLAINS_FOLIAGE: [u8; 3] = [0x59, 0xAE, 0x30];
 /// Standard blue for water in plains/temperate biomes (#3F76E4).
 const PLAINS_WATER: [u8; 3] = [0x3F, 0x76, 0xE4];
 
@@ -372,14 +400,22 @@ fn tint_for(tex_name: &str) -> Option<[u8; 3]> {
         | "short_grass" | "grass"
         | "tall_grass" | "tall_grass_top" | "tall_grass_bottom"
         | "fern" | "large_fern" | "large_fern_top" | "large_fern_bottom"
-        | "sugar_cane" | "vine"
+        // `sugar_cane` ships already coloured and must not be tinted; `vine`
+        // takes the foliage colour, not the grass one, and is listed below.
         // Crop stems are grayscale and biome-tinted by the game
         | "melon_stem" | "pumpkin_stem"
         | "attached_melon_stem" | "attached_pumpkin_stem" => Some(PLAINS_GRASS),
 
-        // ── Leaves ───────────────────────────────────────────────────────
-        "oak_leaves" | "jungle_leaves" | "acacia_leaves" | "dark_oak_leaves"
-        | "mangrove_leaves" | "birch_leaves" => Some(PLAINS_FOLIAGE),
+        // ── Leaves and ground foliage ────────────────────────────────────
+        // `bush` and `leaf_litter` (1.21.5) ship as grayscale like the
+        // leaves do. They were listed for the atlas but not here, so blocks
+        // taking the prototype path came out colourless while the very same
+        // block drawn from the atlas looked right.
+        // `jungle_leaves` is absent on purpose: it ships already coloured, so
+        // tinting it double-darkens the canopy.
+        "oak_leaves" | "acacia_leaves" | "dark_oak_leaves"
+        | "mangrove_leaves" | "birch_leaves" | "pale_oak_leaves"
+        | "vine" | "bush" | "leaf_litter" => Some(PLAINS_FOLIAGE),
         "spruce_leaves" => Some([0x61, 0x99, 0x61]),
         // Cherry leaves ship fully coloured in the JAR — no tint needed.
 
@@ -388,10 +424,26 @@ fn tint_for(tex_name: &str) -> Option<[u8; 3]> {
         "lily_pad" | "lilypad" => Some([0x20, 0x80, 0x30]),
 
         // ── Water ────────────────────────────────────────────────────────
-        "water_still" | "water_flow" => Some(PLAINS_WATER),
+        // `water` itself is listed because the fluid has no model JSON to name
+        // a texture, so consumers ask for the block id and resolve by prefix —
+        // and `water_overlay` is what that fallback often lands on. All three
+        // are the same grayscale mask and all three need the biome colour;
+        // missing them renders the ocean as a flat grey slab.
+        "water" | "water_still" | "water_flow" | "water_overlay" => Some(PLAINS_WATER),
 
         _ => None,
     }
+}
+
+/// Biome tint for a texture the JAR ships as grayscale, if it needs one.
+///
+/// Exposed so consumers that write out raw JAR PNGs — the prototype exporter,
+/// which emits one texture file per block rather than an atlas — apply the
+/// same colour the atlas builder bakes in. Skipping it is not a subtle
+/// difference: grass tops and leaves are stored as near-white grayscale and
+/// render as white or grey patches without it.
+pub fn biome_tint(tex_name: &str) -> Option<[u8; 3]> {
+    tint_for(tex_name)
 }
 
 /// Multiply every pixel of a tile by an RGB tint.

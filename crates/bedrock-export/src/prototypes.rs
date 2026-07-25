@@ -1,0 +1,348 @@
+//! Per-block-type prototype meshes, for importers that place one real mesh
+//! per block instead of drawing a textured cube from a shared atlas.
+//!
+//! A shared atlas has to be right about two independent things at once: which
+//! tile a block maps to, and where that tile's edges are. Both have been a
+//! steady source of bugs — a swatch table generated from a different Mineways
+//! build silently pointed blocks at unrelated pictures, and UVs sampled on a
+//! tile boundary bled the neighbouring tile in as a thin line along every
+//! block edge.
+//!
+//! A prototype sidesteps the whole class: one small OBJ per block type holding
+//! that block's true geometry at the origin, textured from named PNGs pulled
+//! straight out of the player's own client JAR. Nothing is shared, so nothing
+//! can bleed, and a texture is found by name rather than by position in a
+//! table that can drift.
+//!
+//! The importer instances these at the positions in `blocks.json`, which is
+//! the same mechanism that already places MCprep assets.
+
+use bedrock_parser::block_shape;
+use bedrock_parser::jar_textures::JarTextureLoader;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::{BufWriter, Write};
+use std::path::Path;
+
+/// What [`write_block_prototypes`] produced.
+#[derive(Debug, Default)]
+pub struct PrototypeStats {
+    /// Block types that got a prototype mesh.
+    pub written: usize,
+    /// Distinct texture PNGs extracted from the JAR.
+    pub textures: usize,
+    /// Block types whose geometry could not be built.
+    pub skipped: Vec<String>,
+}
+
+/// Write `prototypes/<block>.obj` + `.mtl` and `prototypes/textures/*.png`
+/// for every block id in `blocks`.
+///
+/// Geometry comes from the same per-block model data the main exporter uses,
+/// evaluated at the origin with nothing adjacent, so every face is present —
+/// an instanced prototype is placed wherever the block occurs and cannot know
+/// in advance which of its faces will be hidden.
+pub fn write_block_prototypes(
+    obj_path: &Path,
+    blocks: &BTreeMap<String, BTreeMap<String, String>>,
+) -> PrototypeStats {
+    let mut stats = PrototypeStats::default();
+
+    let dir = match obj_path.parent() {
+        Some(parent) => parent.join("prototypes"),
+        None => return stats,
+    };
+    let texture_dir = dir.join("textures");
+    if std::fs::create_dir_all(&texture_dir).is_err() {
+        tracing::warn!("could not create {}", texture_dir.display());
+        return stats;
+    }
+
+    let loader = match JarTextureLoader::load() {
+        Ok(loader) => loader,
+        Err(err) => {
+            tracing::warn!("no client JAR available for prototype textures: {err}");
+            return stats;
+        }
+    };
+
+    let mut extracted: BTreeSet<String> = BTreeSet::new();
+
+    for (block, properties) in blocks {
+        // No neighbours: every face of the prototype must be drawn.
+        let nothing_adjacent = |_: i32, _: i32, _: i32| -> Option<&str> { None };
+        let props: std::collections::HashMap<String, String> = properties
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let quads = block_shape::block_quads_stated(
+            0,
+            0,
+            0,
+            &format!("minecraft:{block}"),
+            &props,
+            &nothing_adjacent,
+        );
+        if quads.is_empty() {
+            stats.skipped.push(block.clone());
+            continue;
+        }
+
+        // Several vanilla models stack coincident elements: `grass_block` is
+        // literally two 0..16 cubes, the second carrying only the tinted side
+        // overlay. The game draws those in a defined order; a mesh renderer
+        // has no such rule and two faces at identical coordinates z-fight into
+        // hard stripes. Push each repeat of a face a hair further out along
+        // its own normal so the overlay always wins, by less than a millimetre
+        // at Minecraft scale.
+        let quads = separate_coincident_faces(quads);
+
+        // Group faces by the texture they use — that becomes one material each.
+        let mut by_texture: BTreeMap<String, Vec<&block_shape::BlockQuad>> = BTreeMap::new();
+        for quad in &quads {
+            let texture = quad.texture.clone().unwrap_or_else(|| block.clone());
+            by_texture.entry(texture).or_default().push(quad);
+        }
+
+        let obj_file = dir.join(format!("{block}.obj"));
+        let mtl_file = dir.join(format!("{block}.mtl"));
+        let Ok(obj) = std::fs::File::create(&obj_file) else {
+            stats.skipped.push(block.clone());
+            continue;
+        };
+        let mut obj = BufWriter::new(obj);
+        let _ = writeln!(obj, "# Project Bedrock prototype: {block}");
+        let _ = writeln!(obj, "mtllib {block}.mtl");
+
+        // Centre the prototype on its own origin so an instance lands at the
+        // block's centre rather than its corner.
+        let mut vertex_base = 1usize;
+        let mut wrote_any = false;
+        let mut materials: Vec<(String, bool)> = Vec::new();
+
+        for (texture, group) in &by_texture {
+            let cutout = extract_texture(&loader, texture, &texture_dir, &mut extracted);
+            materials.push((texture.clone(), cutout));
+
+            let _ = writeln!(obj, "o {block}_{texture}");
+            let _ = writeln!(obj, "usemtl {texture}");
+            for quad in group {
+                for corner in &quad.corners {
+                    let _ = writeln!(
+                        obj,
+                        "v {:.4} {:.4} {:.4}",
+                        corner[0] - 0.5,
+                        corner[1] - 0.5,
+                        corner[2] - 0.5
+                    );
+                }
+                // The prototype's texture is the block's own PNG, so each face
+                // spans the whole image rather than a slice of an atlas.
+                let uvs = block_shape::face_uv_corners(quad);
+                for uv in &uvs {
+                    let _ = writeln!(obj, "vt {:.4} {:.4}", uv[0], 1.0 - uv[1]);
+                }
+                let _ = writeln!(
+                    obj,
+                    "f {}/{} {}/{} {}/{} {}/{}",
+                    vertex_base,
+                    vertex_base,
+                    vertex_base + 1,
+                    vertex_base + 1,
+                    vertex_base + 2,
+                    vertex_base + 2,
+                    vertex_base + 3,
+                    vertex_base + 3
+                );
+                vertex_base += 4;
+                wrote_any = true;
+            }
+        }
+        let _ = obj.flush();
+
+        if !wrote_any {
+            let _ = std::fs::remove_file(&obj_file);
+            stats.skipped.push(block.clone());
+            continue;
+        }
+
+        if let Ok(mtl) = std::fs::File::create(&mtl_file) {
+            let mut mtl = BufWriter::new(mtl);
+            for (texture, cutout) in &materials {
+                let _ = writeln!(mtl, "\nnewmtl {texture}");
+                let _ = writeln!(mtl, "Ka 0.0000 0.0000 0.0000");
+                let _ = writeln!(mtl, "Kd 1.0000 1.0000 1.0000");
+                let _ = writeln!(mtl, "Ks 0.0000 0.0000 0.0000");
+                let _ = writeln!(mtl, "Ns 0");
+                // Fluids and glass are see-through as a whole surface rather
+                // than per-pixel, which no amount of cutout alpha expresses:
+                // without a dissolve they read as solid slabs, and an ocean
+                // covering most of a world hides everything under it.
+                let dissolve = translucency(texture);
+                let _ = writeln!(
+                    mtl,
+                    "illum {}",
+                    if *cutout || dissolve.is_some() { 4 } else { 2 }
+                );
+                let _ = writeln!(mtl, "map_Kd textures/{texture}.png");
+                if let Some(d) = dissolve {
+                    let _ = writeln!(mtl, "d {d:.3}");
+                    let _ = writeln!(mtl, "Tr {:.3}", 1.0 - d);
+                } else if *cutout {
+                    let _ = writeln!(mtl, "map_d textures/{texture}.png");
+                }
+            }
+            let _ = mtl.flush();
+        }
+        stats.written += 1;
+    }
+
+    stats.textures = extracted.len();
+    stats
+}
+
+/// Offset repeats of the same face outward so coincident geometry can't z-fight.
+///
+/// Only exact duplicates are moved, and only the second and later ones, so a
+/// model with no stacked elements comes through byte-identical.
+fn separate_coincident_faces(quads: Vec<block_shape::BlockQuad>) -> Vec<block_shape::BlockQuad> {
+    /// One tenth of a millimetre at Minecraft scale: below any texel, well
+    /// above the depth precision a renderer needs to order two faces.
+    const NUDGE: f64 = 0.001;
+
+    let key = |quad: &block_shape::BlockQuad| -> Vec<i64> {
+        quad.corners
+            .iter()
+            .flatten()
+            .map(|v| (v * 4096.0).round() as i64)
+            .collect()
+    };
+
+    let mut seen: BTreeMap<Vec<i64>, u32> = BTreeMap::new();
+    let mut out = Vec::with_capacity(quads.len());
+    for mut quad in quads {
+        let repeats = seen.entry(key(&quad)).or_insert(0);
+        if *repeats > 0 {
+            let offset = NUDGE * f64::from(*repeats);
+            for corner in &mut quad.corners {
+                for (axis, value) in corner.iter_mut().enumerate() {
+                    *value += offset * f64::from(quad.normal[axis]);
+                }
+            }
+        }
+        *repeats += 1;
+        out.push(quad);
+    }
+    out
+}
+
+/// Whole-surface opacity for materials the game draws translucent, as an MTL
+/// `d` (dissolve) value, or `None` for the fully opaque majority.
+fn translucency(texture: &str) -> Option<f32> {
+    match texture {
+        "water" | "water_still" | "water_flow" | "water_overlay" => Some(0.55),
+        "ice" | "frosted_ice" => Some(0.75),
+        "glass" | "tinted_glass" => Some(0.35),
+        _ => None,
+    }
+}
+
+/// Copy one texture out of the JAR, returning whether it has real cutout alpha.
+///
+/// The JAR stores biome-coloured textures — grass tops, most leaves, vines,
+/// stems — as grayscale masks that the game multiplies by a colormap value at
+/// draw time. Writing those out untouched is what makes canopies and grass
+/// render as white or grey patches, so the same tint the atlas builder bakes
+/// in is applied here.
+fn extract_texture(
+    loader: &JarTextureLoader,
+    name: &str,
+    dir: &Path,
+    seen: &mut BTreeSet<String>,
+) -> bool {
+    // Track the name the texture was actually found under. A block whose model
+    // has no explicit texture asks for its own id -- `water` -- and resolves
+    // through the prefix fallback to `water_still`. Tint has to be looked up
+    // against the resolved name: `water` is in no tint list, so keying on the
+    // request left the ocean as raw grayscale.
+    let found = loader
+        .get(name)
+        .map(|bytes| (name.to_owned(), bytes.to_vec()))
+        .or_else(|| {
+            loader
+                .find_prefixed(&format!("{name}_"))
+                .map(|(resolved, bytes)| (resolved.to_owned(), bytes.to_vec()))
+        });
+    let Some((resolved, png)) = found else {
+        return false;
+    };
+
+    // Animated textures ship as a vertical strip of square frames. Written out
+    // whole, a face's 0..1 V range covers every frame at once.
+    let png = first_animation_frame(&png).unwrap_or(png);
+
+    if seen.insert(name.to_owned()) {
+        let tint = bedrock_parser::texture::biome_tint(&resolved)
+            .or_else(|| bedrock_parser::texture::biome_tint(name));
+        let tinted = tint.and_then(|tint| tint_png(&png, tint));
+        let _ = std::fs::write(
+            dir.join(format!("{name}.png")),
+            tinted.as_deref().unwrap_or(&png),
+        );
+    }
+    has_alpha(&png)
+}
+
+/// Crop an animation strip down to its first frame, or `None` if it is a
+/// plain square texture.
+///
+/// Minecraft stacks animation frames vertically in one PNG — `water_still` is
+/// 16 wide and 512 tall, 32 frames — and describes the timing in a sidecar
+/// `.mcmeta`. A static mesh wants one frame.
+fn first_animation_frame(png: &[u8]) -> Option<Vec<u8>> {
+    let image = image::load_from_memory(png).ok()?;
+    let (width, height) = (image.width(), image.height());
+    if height <= width || width == 0 || height % width != 0 {
+        return None;
+    }
+    let frame = image.crop_imm(0, 0, width, width);
+    let mut out = Vec::new();
+    frame
+        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+        .ok()?;
+    Some(out)
+}
+
+/// Multiply a PNG's RGB by `tint`, leaving alpha alone, and re-encode it.
+///
+/// Alpha has to survive untouched: leaves and the grass side overlay are
+/// cutout textures whose transparency the MTL references through `map_d`.
+fn tint_png(png: &[u8], tint: [u8; 3]) -> Option<Vec<u8>> {
+    let mut rgba = image::load_from_memory(png).ok()?.to_rgba8();
+    for pixel in rgba.pixels_mut() {
+        for channel in 0..3 {
+            pixel.0[channel] =
+                (u16::from(pixel.0[channel]) * u16::from(tint[channel]) / 255) as u8;
+        }
+    }
+    let mut out = Vec::new();
+    image::DynamicImage::ImageRgba8(rgba)
+        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+        .ok()?;
+    Some(out)
+}
+
+/// True when a PNG is meaningfully see-through, so its material needs `map_d`.
+fn has_alpha(png: &[u8]) -> bool {
+    let Ok(image) = image::load_from_memory(png) else {
+        return false;
+    };
+    let rgba = image.to_rgba8();
+    let (mut clear, mut total) = (0usize, 0usize);
+    for pixel in rgba.pixels() {
+        total += 1;
+        if pixel.0[3] < 128 {
+            clear += 1;
+        }
+    }
+    total > 0 && clear * 10 > total
+}

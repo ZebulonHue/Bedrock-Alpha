@@ -27,15 +27,21 @@ impl World {
     }
 
     /// `(region_x, region_z, path)` for every region file across the overworld
-    /// and all dimension folders (`DIM1` = End, `DIM-1` = Nether, `DIM<n>` =
-    /// custom). Scanning the dimension folders is what lets worlds whose
-    /// chunks live outside the overworld — for example an End-only save whose
-    /// `.mca` files are under `DIM1/region/` — actually load.
+    /// and all dimension folders: the legacy `DIM1` (End) / `DIM-1` (Nether) /
+    /// `DIM<n>` (custom) layout, and the modern `dimensions/<namespace>/<name>`
+    /// layout (1.16+ custom dimensions — and, on at least one real-world save
+    /// seen in the wild, used for the overworld itself instead of the
+    /// top-level `region/` folder). Scanning all of these is what lets worlds
+    /// whose chunks live outside the conventional top-level `region/` — for
+    /// example an End-only save under `DIM1/region/`, or a save whose
+    /// overworld itself lives under `dimensions/minecraft/overworld/region/`
+    /// — actually load.
     pub fn regions(&self) -> Vec<(i32, i32, PathBuf)> {
         let mut regions = Vec::new();
 
         // Candidate dimension roots: the world folder (overworld) plus any
-        // `DIM<n>` directory (e.g. `DIM1`, `DIM-1`).
+        // `DIM<n>` directory (e.g. `DIM1`, `DIM-1`), plus every
+        // `dimensions/<namespace>/<name>` directory.
         let mut roots = vec![self.folder.clone()];
         if let Ok(entries) = std::fs::read_dir(&self.folder) {
             for entry in entries.flatten() {
@@ -49,6 +55,23 @@ impl World {
                 if let Some(rest) = name.strip_prefix("DIM") {
                     if rest.parse::<i32>().is_ok() {
                         roots.push(path);
+                    }
+                }
+            }
+        }
+        if let Ok(namespaces) = std::fs::read_dir(self.folder.join("dimensions")) {
+            for namespace_entry in namespaces.flatten() {
+                let namespace_path = namespace_entry.path();
+                if !namespace_path.is_dir() {
+                    continue;
+                }
+                let Ok(names) = std::fs::read_dir(&namespace_path) else {
+                    continue;
+                };
+                for name_entry in names.flatten() {
+                    let name_path = name_entry.path();
+                    if name_path.is_dir() {
+                        roots.push(name_path);
                     }
                 }
             }
@@ -108,6 +131,31 @@ mod tests {
         coords.sort_unstable();
 
         assert_eq!(coords, vec![(0, 0), (0, 0), (2, -3)]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn regions_scans_modern_dimensions_folder() {
+        let dir = std::env::temp_dir().join(format!("bedrock-dim-test2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // Overworld data living under dimensions/minecraft/overworld/region,
+        // as seen on a real-world save instead of the usual top-level region/.
+        std::fs::create_dir_all(dir.join("dimensions").join("minecraft").join("overworld").join("region"))
+            .unwrap();
+        std::fs::write(
+            dir.join("dimensions")
+                .join("minecraft")
+                .join("overworld")
+                .join("region")
+                .join("r.-1.0.mca"),
+            b"",
+        )
+        .unwrap();
+
+        let world = World::open(&dir);
+        let coords: Vec<(i32, i32)> = world.regions().into_iter().map(|(x, z, _)| (x, z)).collect();
+
+        assert_eq!(coords, vec![(-1, 0)]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

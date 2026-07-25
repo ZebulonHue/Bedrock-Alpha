@@ -2,9 +2,9 @@
 //! Includes chunk streaming: dynamically loading/unloading chunks as the
 //! camera moves, enabling arbitrarily large worlds.
 
-use crate::loader::{load_active_world, load_one_chunk, ActiveWorld};
+use crate::loader::{load_active_world, load_chunks_for_region, load_one_chunk, ActiveWorld};
 use bedrock_export::gltf::export_gltf;
-use bedrock_export::obj::{export_obj, ExportRegion, ExportStats};
+use bedrock_export::obj::{export_obj_with_options, ExportOptions, ExportRegion, ExportStats};
 use bedrock_parser::chunk::Chunk;
 use bedrock_parser::detect::WorldSummary;
 use bedrock_parser::mineways::build_mineways_tileset;
@@ -291,8 +291,21 @@ impl BedrockApp {
             tracing::warn!("No world loaded — nothing to export");
             return;
         };
-        let chunks: Vec<Chunk> = aw.chunk_map.values().cloned().collect();
         let region = self.export_region;
+        // Read the region's chunks from disk rather than from whatever the
+        // streaming loader happens to have resident: `chunk_map` is empty for
+        // Java worlds and only camera-local for Bedrock, so exporting from it
+        // silently produced "no blocks to export" for any real selection.
+        let mut chunks: Vec<Chunk> = load_chunks_for_region(
+            &aw.handle,
+            region.min[0],
+            region.min[2],
+            region.max[0],
+            region.max[2],
+        );
+        if chunks.is_empty() {
+            chunks = aw.chunk_map.values().cloned().collect();
+        }
         let out_dir = if self.settings.export.output_dir.is_empty() {
             dirs::document_dir()
                 .unwrap_or_else(|| std::path::PathBuf::from("."))
@@ -343,8 +356,18 @@ impl BedrockApp {
             let texture_keys: Vec<String> = chunks.iter().flat_map(|c| c.texture_keys()).collect();
             let tiles = build_mineways_tileset(&texture_keys);
             let result = match format {
-                ExportFormat::Obj => export_obj(&chunks, &region, &export_path, &tiles)
-                    .map_err(|err| err.to_string()),
+                ExportFormat::Obj => export_obj_with_options(
+                    &chunks,
+                    &region,
+                    &export_path,
+                    &tiles,
+                    // The importer needs this to place real 3D assets.
+                    &ExportOptions {
+                        write_block_manifest: true,
+                        write_prototypes: true,
+                    },
+                )
+                .map_err(|err| err.to_string()),
                 ExportFormat::Gltf => export_gltf(&chunks, &region, &export_path, &tiles)
                     .map_err(|err| err.to_string()),
                 _ => Err(format!("Unsupported export format: {format:?}")),

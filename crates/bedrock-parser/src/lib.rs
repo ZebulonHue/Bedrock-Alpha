@@ -16,7 +16,9 @@ pub mod block_definitions;
 /// Per-face texture resolution for vanilla blocks.
 pub mod block_model;
 /// Per-block-type geometry generation (like Mineways' gBlockDefinitions[]).
+pub mod block_models;
 pub mod block_shape;
+pub mod block_shapes;
 pub mod blocks;
 pub mod chunk;
 pub mod detect;

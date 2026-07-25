@@ -7,3 +7,4 @@
 
 pub mod gltf;
 pub mod obj;
+pub mod prototypes;

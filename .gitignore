@@ -6,3 +6,11 @@
 **/*.blend1
 **/*.pyc
 __pycache__/
+
+# Extracted Minecraft client assets — derived from the game, not ours to redistribute.
+# Regenerate locally; tools/gen_*.py read from the installed client JAR.
+extracted_mc_assets/
+extracted_mc_assets.zip
+
+# Vendored for reference only (275 MB); check out separately if needed.
+third_party/Mineways/

@@ -144,6 +144,26 @@ impl JarTextureLoader {
         self.textures.get(alias).map(Vec::as_slice)
     }
 
+    /// First texture (by name order) whose name starts with `prefix`.
+    ///
+    /// Multi-part blocks have no texture named after the block itself: a
+    /// `sulfur_spike` ships as `sulfur_spike_up_base`, `..._middle`,
+    /// `..._tip` and so on. Exact lookup misses all of them, so this picks a
+    /// representative piece. Sorted so the choice is deterministic rather
+    /// than dependent on hash order.
+    pub fn find_prefixed(&self, prefix: &str) -> Option<(&str, &[u8])> {
+        let mut best: Option<&String> = None;
+        for name in self.textures.keys() {
+            if !name.starts_with(prefix) {
+                continue;
+            }
+            if best.is_none_or(|b| name < b) {
+                best = Some(name);
+            }
+        }
+        best.map(|n| (n.as_str(), self.textures[n].as_slice()))
+    }
+
     /// Number of textures loaded.
     pub fn len(&self) -> usize {
         self.textures.len()

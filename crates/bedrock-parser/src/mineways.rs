@@ -7,7 +7,7 @@
 
 use crate::block_definitions::G_BLOCK_DEFINITIONS;
 use crate::chunk::strip_namespace;
-use crate::mineways_data::{swatch_by_filename, swatch_uv};
+use crate::mineways_data::{swatch_by_filename, swatch_uv, TILE_TABLE};
 
 /// Common block name transformations: maps non-standard Bedrock names
 /// to the vanilla Java texture filenames used in Mineways' tile table.
@@ -157,6 +157,156 @@ fn find_swatch(name: &str) -> Option<usize> {
     None
 }
 
+/// Last-resort swatch resolution for blocks whose own name is not a texture
+/// filename in the atlas.
+///
+/// The Mineways tile table is keyed by *texture* names, not block ids, and the
+/// two diverge for whole families: a two-tall plant ships only as
+/// `<name>_top`/`<name>_bottom`, and slabs/stairs/walls/fences/carpets have no
+/// texture of their own at all — they reuse their base block's. Without these
+/// rules each such block fails to resolve and the tileset builder falls it
+/// through to `[0; 6]`, rendering it as `grass_block_top`. Handling them by
+/// family rather than one arm per block keeps new variants working for free.
+fn fallback_swatch(short: &str) -> Option<usize> {
+    // Two-tall / multi-part blocks: use the upper half's texture, or the
+    // side texture for blocks that only ship `_side`/`_top` pairs.
+    if let Some(idx) = find_swatch(&format!("{short}_top")) {
+        return Some(idx);
+    }
+    if let Some(idx) = find_swatch(&format!("{short}_side")) {
+        return Some(idx);
+    }
+
+    // Cut-down variants reuse the full block's texture. `stone_brick_slab`
+    // needs the pluralised base (`stone_bricks`) and `birch_slab` the wood's
+    // plank texture, hence the extra attempts.
+    for suffix in ["_slab", "_stairs", "_wall"] {
+        if let Some(base) = short.strip_suffix(suffix) {
+            if let Some(idx) = find_swatch(base) {
+                return Some(idx);
+            }
+            if let Some(idx) = find_swatch(&format!("{base}s")) {
+                return Some(idx);
+            }
+            if let Some(idx) = find_swatch(&format!("{base}_planks")) {
+                return Some(idx);
+            }
+            if let Some(idx) = find_swatch(&format!("{base}_top")) {
+                return Some(idx);
+            }
+        }
+    }
+
+    // Plant stems are drawn from the parent plant's texture.
+    if let Some(base) = short.strip_suffix("_stem") {
+        if let Some(idx) = find_swatch(&format!("{base}_side")) {
+            return Some(idx);
+        }
+        if let Some(idx) = find_swatch(&format!("{base}_top")) {
+            return Some(idx);
+        }
+    }
+
+    // Wooden fences/gates/doors are drawn from their plank texture.
+    for suffix in ["_fence_gate", "_fence", "_trapdoor", "_door"] {
+        if let Some(base) = short.strip_suffix(suffix) {
+            if let Some(idx) = find_swatch(&format!("{base}_planks")) {
+                return Some(idx);
+            }
+        }
+    }
+
+    // Waxing only stops oxidation; the texture is the unwaxed block's.
+    if let Some(base) = short.strip_prefix("waxed_") {
+        if let Some(idx) = find_swatch(base) {
+            return Some(idx);
+        }
+        if let Some(idx) = fallback_swatch(base) {
+            return Some(idx);
+        }
+    }
+
+    // Carpet takes the matching wool colour; non-dyed carpets (moss) fall
+    // back to their source block.
+    if let Some(base) = short.strip_suffix("_carpet") {
+        if let Some(idx) = find_swatch(&format!("{base}_wool")) {
+            return Some(idx);
+        }
+        if let Some(idx) = find_swatch(&format!("{base}_block")) {
+            return Some(idx);
+        }
+        if let Some(idx) = find_swatch(base) {
+            return Some(idx);
+        }
+    }
+
+    // Beds share one texture set across all dye colours.
+    if short.ends_with("_bed") {
+        if let Some(idx) = find_swatch("MW_bed_head_top") {
+            return Some(idx);
+        }
+    }
+
+    // A potted plant is textured as the plant it holds.
+    if let Some(plant) = short.strip_prefix("potted_") {
+        if let Some(idx) = find_swatch(plant) {
+            return Some(idx);
+        }
+    }
+
+    // Wall-mounted variants reuse the standing block's texture.
+    if let Some(base) = short.strip_suffix("_wall_torch") {
+        if let Some(idx) = find_swatch(&format!("{base}_torch")) {
+            return Some(idx);
+        }
+    }
+    if short == "wall_torch" {
+        if let Some(idx) = find_swatch("torch") {
+            return Some(idx);
+        }
+    }
+
+    // Infested variants are visually identical to the host block.
+    if let Some(base) = short.strip_prefix("infested_") {
+        if let Some(idx) = find_swatch(base) {
+            return Some(idx);
+        }
+        if let Some(idx) = find_swatch(&format!("{base}_top")) {
+            return Some(idx);
+        }
+    }
+
+    None
+}
+
+/// Remaps a physical cube face index (`[top, bottom, east, west, south,
+/// north]`, matching [`block_shape::CUBE_FACES`](crate::block_shape::CUBE_FACES)
+/// order) onto the logical face slot that [`get_swatch_for_block`]'s
+/// per-face tables assume — i.e. as if the block's pillar `axis` were `y`.
+///
+/// [`get_swatch_for_block`] hardcodes end-grain on faces 0/1 (top/bottom)
+/// and bark on faces 2..6, which is only correct for vertically-placed
+/// pillars (logs, hay/bone blocks, quartz/purpur pillars, chains, ...).
+/// A log placed on its side (`axis=x` or `axis=z`) needs the end-grain
+/// texture on the faces perpendicular to its actual axis instead. Blocks
+/// without an `axis` property (or with `axis="y"`, the default) pass
+/// through unchanged.
+pub fn remap_pillar_face(face_idx: usize, axis: &str) -> usize {
+    match axis {
+        "x" => match face_idx {
+            2 => 0, // east: end-grain slot
+            3 => 1, // west: end-grain slot
+            _ => 2, // top/bottom/south/north: any bark slot
+        },
+        "z" => match face_idx {
+            4 => 0, // south: end-grain slot
+            5 => 1, // north: end-grain slot
+            _ => 2, // top/bottom/east/west: any bark slot
+        },
+        _ => face_idx, // "y" (default) or unrecognised: no remap
+    }
+}
+
 /// Get the swatch indices for all 6 faces of a block.
 ///
 /// Returns `[top, bottom, east, west, south, north]` swatch indices.
@@ -182,7 +332,22 @@ pub fn get_swatch_for_block(name: &str, color: Option<&str>) -> Option<[usize; 6
 
     let tex_name = block_texture_name(short);
 
-    let default_swatch = find_swatch(tex_name).or_else(|| swatch_from_definitions(short))?;
+    // Deliberately NOT `?` here. Many blocks below have a correct explicit
+    // per-face mapping even though no swatch shares their base name — the
+    // atlas ships `podzol_top`/`podzol_side` but no bare `podzol`, and
+    // likewise for `tall_grass`, `large_fern`, beds and others. Bailing on
+    // the name-only lookup before the match ran would throw those mappings
+    // away and drop the block into the caller's `[0; 6]` fallback, i.e.
+    // render it as `grass_block_top`.
+    //
+    // `UNRESOLVED` stands in for "no name-matching swatch" so the per-face
+    // arms can still be consulted; any arm that genuinely needed the default
+    // is caught after the match and reported as a real failure.
+    const UNRESOLVED: usize = usize::MAX;
+    let default_swatch = find_swatch(tex_name)
+        .or_else(|| swatch_from_definitions(short))
+        .or_else(|| fallback_swatch(short))
+        .unwrap_or(UNRESOLVED);
 
     // Per-face overrides for blocks with different textures per side
     let faces = match short {
@@ -716,6 +881,12 @@ pub fn get_swatch_for_block(name: &str, color: Option<&str>) -> Option<[usize; 6
         _ => [default_swatch; 6],
     };
 
+    // An arm that actually consumed the unresolved default is a genuine
+    // lookup failure — report it rather than emitting a bogus swatch index.
+    if faces.iter().any(|&f| f == UNRESOLVED) {
+        return None;
+    }
+
     Some(faces)
 }
 
@@ -739,6 +910,96 @@ pub fn load_terrain_atlas() -> Result<(Vec<u8>, u32, u32), String> {
     Ok((pixels, width, height))
 }
 
+/// Tint for a swatch texture name that `terrainExt.png` ships pre-desaturated
+/// (grayscale), meant to be coloured by the biome at render time — same idea
+/// as [`crate::texture::tint_for`] for the JAR-loader path, but this is a
+/// *separate*, empirically-verified list: the two atlases don't agree on
+/// which textures are grayscale (e.g. this atlas's `mangrove_leaves` and
+/// `pale_oak_leaves` swatches are already fully coloured, unlike the JAR's).
+/// Deliberately excludes `grass_block_side`: that swatch is a pre-composited
+/// dirt+strip image, not grayscale — tinting it as a whole (rather than just
+/// its top face) darkens the dirt too. This is why biome tint must be baked
+/// per-swatch here rather than applied per-material in the Blender importer.
+fn tint_for_atlas_swatch(name: &str) -> Option<[u8; 3]> {
+    match name {
+        // ── Grass colormap ───────────────────────────────────────────────
+        // `grass_block_side` is deliberately absent: unlike the others it is
+        // a pre-composited dirt+strip image, not grayscale, so tinting the
+        // whole tile browns out the dirt. Its separate `_overlay` strip is
+        // the part that takes the colour.
+        "grass_block_top"
+        | "grass_block_side_overlay"
+        | "short_grass"
+        | "fern"
+        | "tall_grass_top"
+        | "tall_grass_bottom"
+        | "large_fern_top"
+        | "large_fern_bottom"
+        | "melon_stem"
+        | "attached_melon_stem"
+        | "pumpkin_stem"
+        | "attached_pumpkin_stem" => Some(crate::texture::PLAINS_GRASS),
+
+        // ── Foliage colormap ─────────────────────────────────────────────
+        // `bush` and `leaf_litter` (1.21.5) use the dry-foliage colour in
+        // some biomes; foliage green is the closest single approximation.
+        // `pale_oak_leaves` is deliberately absent here while being present in
+        // the prototype table: the two draw from different images. The client
+        // JAR ships it grayscale (max channel spread 10/255), but this atlas
+        // ships that tile already coloured (spread 0.029), so tinting it here
+        // would double-darken it. `every_tinted_swatch_is_actually_grayscale`
+        // measures the atlas and enforces exactly that.
+        "oak_leaves" | "acacia_leaves" | "dark_oak_leaves" | "birch_leaves"
+        | "mangrove_leaves" | "vine" | "bush" | "leaf_litter" => {
+            Some(crate::texture::PLAINS_FOLIAGE)
+        }
+
+        // Spruce has its own fixed colour rather than a biome lookup.
+        "spruce_leaves" => Some([0x61, 0x99, 0x61]),
+        // Lily pad is a fixed green in game, not biome-driven.
+        "lily_pad" => Some([0x20, 0x80, 0x30]),
+
+        // Everything else ships already-coloured in this atlas and must be
+        // left alone — jungle/cherry/azalea/pale_oak leaves, firefly_bush,
+        // sugar_cane and moss_block all measure as clearly non-grayscale.
+        _ => None,
+    }
+}
+
+/// Multiply the RGB channels (alpha untouched) of every biome-tintable
+/// swatch's 16x16 region in-place within the full atlas pixel buffer.
+fn tint_biome_swatches(pixels: &mut [u8], width: u32, height: u32) {
+    let tile = 16usize;
+    let width = width as usize;
+    let height = height as usize;
+    // The table is not one-entry-per-tile: several entries can share the same
+    // (col, row) when one image serves multiple block states. Tinting is a
+    // multiply applied in place, so visiting a tile twice would darken it
+    // twice — track which tiles have been done.
+    let mut tinted: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
+    for &(col, row, name) in TILE_TABLE.iter() {
+        let Some(tint) = tint_for_atlas_swatch(name) else {
+            continue;
+        };
+        if !tinted.insert((col, row)) {
+            continue;
+        }
+        let x0 = col as usize * tile;
+        let y0 = row as usize * tile;
+        if x0 + tile > width || y0 + tile > height {
+            continue;
+        }
+        for y in y0..y0 + tile {
+            for x in x0..x0 + tile {
+                let idx = (y * width + x) * 4;
+                pixels[idx] = (u16::from(pixels[idx]) * u16::from(tint[0]) / 255) as u8;
+                pixels[idx + 1] = (u16::from(pixels[idx + 1]) * u16::from(tint[1]) / 255) as u8;
+                pixels[idx + 2] = (u16::from(pixels[idx + 2]) * u16::from(tint[2]) / 255) as u8;
+            }
+        }
+    }
+}
+
 /// Build a `FaceAwareTileSet` from the Mineways terrain atlas.
 /// This replaces the dynamic JAR-based atlas for OBJ export.
 ///
@@ -751,37 +1012,487 @@ pub fn load_terrain_atlas() -> Result<(Vec<u8>, u32, u32), String> {
 pub fn build_mineways_tileset(texture_keys: &[String]) -> crate::texture::FaceAwareTileSet {
     use crate::texture::{FaceAwareTileSet, TileSet};
 
-    let (pixels, width, height) = load_terrain_atlas().unwrap_or_else(|e| {
+    let (mut pixels, width, height) = load_terrain_atlas().unwrap_or_else(|e| {
         tracing::warn!("Failed to load Mineways atlas: {e}, falling back to procedural");
         // Return a 16x16 placeholder
         (vec![0u8; 16 * 16 * 4], 16, 16)
     });
+    tint_biome_swatches(&mut pixels, width, height);
 
     // Build per-face UV mappings for all requested blocks
     // The atlas is a single large image (terrainExt.png), not a packed set of tiles.
     // We just need pixels/width/height for the atlas image.
+    // Neutral stand-in for blocks with no swatch in this atlas. Swatch 0 is
+    // `grass_block_top`, so the old fallback silently rendered every
+    // unrecognised block as bright (and, since tinting, green) grass —
+    // indistinguishable from real terrain and easy to miss in a render.
+    // `terrainExt.png` predates newer blocks (1.21.5's `leaf_litter`, `bush`,
+    // `firefly_bush`, plus `sulfur`/`cinnabar`), so misses are expected on an
+    // up-to-date save; stone at least reads as "generic block".
+    const NEUTRAL_SWATCH: usize = 1; // "stone"
+
     let mut face_uvs = std::collections::HashMap::new();
+    // Pass 1: resolve every key against the Mineways table, noting the ones
+    // it has no tile for. Those get filled in from the game's own JAR below.
+    let mut resolved: Vec<(&String, [usize; 6])> = Vec::new();
+    let mut unmapped: Vec<&str> = Vec::new();
     for key in texture_keys {
         let (name, color) = split_texture_key(key);
         let short = strip_namespace(name);
-        let faces = get_swatch_for_block(short, color).unwrap_or([0; 6]);
+        // Air emits no geometry, so it never needs a tile — resolving it
+        // would only add noise to the "missing texture" report.
+        if crate::blocks::is_air(short) {
+            continue;
+        }
+        match get_swatch_for_block(short, color) {
+            Some(faces) => resolved.push((key, faces)),
+            None => unmapped.push(short),
+        }
+    }
+    unmapped.sort_unstable();
+    unmapped.dedup();
+
+    // Pass 2: pull the missing textures straight from the installed client
+    // JAR and append them to the atlas as extra rows. `terrainExt.png` is a
+    // snapshot of whatever blocks existed when it was built, so an
+    // up-to-date save always has some it predates; the JAR is by definition
+    // current with the world being exported.
+    let extra_tiles = if unmapped.is_empty() {
+        Vec::new()
+    } else {
+        collect_jar_tiles(&unmapped)
+    };
+    let extra_index: std::collections::HashMap<&str, usize> = extra_tiles
+        .iter()
+        .enumerate()
+        .map(|(i, (block, _, _))| (block.as_str(), i))
+        .collect();
+
+    // Pass 3: grow the pixel buffer, then compute every UV against the final
+    // height — appending rows changes the V of *existing* tiles too, so the
+    // UVs cannot be taken from `swatch_uv`'s fixed-height constant.
+    let base_rows = height / 16;
+    let extra_rows = (extra_tiles.len() as u32).div_ceil(16);
+    let final_height = height + extra_rows * 16;
+    if extra_rows > 0 {
+        pixels.resize((width * final_height * 4) as usize, 0);
+        for (i, (_, _, tile)) in extra_tiles.iter().enumerate() {
+            let col = i as u32 % 16;
+            let row = base_rows + i as u32 / 16;
+            for ty in 0..16u32 {
+                let dst = (((row * 16 + ty) * width + col * 16) * 4) as usize;
+                let src = (ty * 16 * 4) as usize;
+                pixels[dst..dst + 64].copy_from_slice(&tile[src..src + 64]);
+            }
+        }
+    }
+
+    // Inset by half a texel. Sampling right on a tile boundary lets the
+    // neighbouring tile bleed in under any filtering, which shows up as a thin
+    // grid of wrong-coloured lines tracing every block edge in the model.
+    let uv_for = |col: u32, row: u32| -> [f32; 4] {
+        let du = 0.5 / 256.0;
+        let dv = 0.5 / final_height as f32;
+        [
+            col as f32 / 16.0 + du,
+            row as f32 * 16.0 / final_height as f32 + dv,
+            (col + 1) as f32 / 16.0 - du,
+            (row + 1) as f32 * 16.0 / final_height as f32 - dv,
+        ]
+    };
+    let uv_for_swatch = |swatch: usize| -> Option<[f32; 4]> {
+        let &(col, row, _) = TILE_TABLE.get(swatch)?;
+        Some(uv_for(col, row))
+    };
+
+    for (key, faces) in resolved {
         for (i, &swatch) in faces.iter().enumerate() {
-            if let Some(uv) = swatch_uv(swatch) {
+            if let Some(uv) = uv_for_swatch(swatch) {
                 face_uvs.insert((key.clone(), i), uv);
             }
         }
     }
 
-    // Build a minimal tile set — the face_uvs map has all the UV data.
-    // The atlas pixel buffer is terrainExt.png itself.
-    let atlas = TileSet::from_raw(pixels, width, height);
+    let mut still_missing: Vec<&str> = Vec::new();
+    for key in texture_keys {
+        let (name, _) = split_texture_key(key);
+        let short = strip_namespace(name);
+        if crate::blocks::is_air(short) || face_uvs.contains_key(&(key.clone(), 0)) {
+            continue;
+        }
+        let uv = match extra_index.get(short) {
+            Some(&i) => uv_for(i as u32 % 16, base_rows + i as u32 / 16),
+            None => {
+                still_missing.push(short);
+                uv_for_swatch(NEUTRAL_SWATCH).unwrap_or([0.0, 0.0, 1.0, 1.0])
+            }
+        };
+        for i in 0..6 {
+            face_uvs.insert((key.clone(), i), uv);
+        }
+    }
 
-    FaceAwareTileSet { atlas, face_uvs }
+    if !extra_tiles.is_empty() {
+        tracing::info!(
+            "Filled {} block(s) missing from terrainExt.png using textures from the client JAR: {}",
+            extra_tiles.len(),
+            extra_tiles
+                .iter()
+                .map(|(b, t, _)| format!("{b} -> {t}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    still_missing.sort_unstable();
+    still_missing.dedup();
+    if !still_missing.is_empty() {
+        tracing::warn!(
+            "{} block type(s) have no texture in either terrainExt.png or the \
+             client JAR and were drawn as plain stone: {}",
+            still_missing.len(),
+            still_missing.join(", ")
+        );
+    }
+
+    // The face_uvs map holds all the UV data; the tile set just carries the
+    // atlas image (terrainExt.png plus any JAR-sourced rows appended above).
+    let atlas = TileSet::from_raw(pixels, width, final_height);
+
+    // Direct texture-name -> UV lookup, for model-driven geometry: a vanilla
+    // block model names the texture on each face rather than relying on the
+    // block's face order.
+    let mut texture_uvs = std::collections::HashMap::new();
+    for (index, &(col, row, name)) in TILE_TABLE.iter().enumerate() {
+        let _ = index;
+        texture_uvs.entry(name.to_owned()).or_insert_with(|| uv_for(col, row));
+    }
+    for (i, (_, tex_name, _)) in extra_tiles.iter().enumerate() {
+        texture_uvs.insert(
+            tex_name.clone(),
+            uv_for(i as u32 % 16, base_rows + i as u32 / 16),
+        );
+    }
+
+    FaceAwareTileSet { atlas, face_uvs, texture_uvs }
+}
+
+/// Load a 16x16 RGBA tile per block name from the installed client JAR.
+///
+/// Returns `(block_name, texture_name, tile_pixels)`. Blocks with no matching
+/// texture are simply absent from the result.
+fn collect_jar_tiles(blocks: &[&str]) -> Vec<(String, String, Vec<u8>)> {
+    let loader = match crate::jar_textures::JarTextureLoader::load() {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!("No client JAR available to fill missing block textures: {e}");
+            return Vec::new();
+        }
+    };
+
+    let mut out = Vec::new();
+    for &block in blocks {
+        // Exact name, then the usual per-face spellings, then any texture
+        // whose name starts with the block's (multi-part blocks such as
+        // `sulfur_spike` only ship `sulfur_spike_up_base` and friends).
+        let direct = [
+            block.to_owned(),
+            format!("{block}_top"),
+            format!("{block}_side"),
+            format!("{block}_still"),
+        ];
+        let found = direct
+            .iter()
+            .find_map(|n| loader.get(n).map(|b| (n.clone(), b)))
+            .or_else(|| {
+                loader
+                    .find_prefixed(&format!("{block}_"))
+                    .map(|(n, b)| (n.to_owned(), b))
+            });
+
+        let Some((tex_name, png)) = found else {
+            continue;
+        };
+        let Some(mut tile) = decode_jar_tile(png) else {
+            tracing::warn!("could not decode JAR texture {tex_name} for {block}");
+            continue;
+        };
+        // Grayscale foliage from the JAR needs the same biome tint the
+        // baked-in atlas swatches get.
+        if let Some(tint) = tint_for_atlas_swatch(&tex_name) {
+            for px in tile.chunks_exact_mut(4) {
+                for c in 0..3 {
+                    px[c] = (u16::from(px[c]) * u16::from(tint[c]) / 255) as u8;
+                }
+            }
+        }
+        out.push((block.to_owned(), tex_name, tile));
+    }
+    out
+}
+
+/// Decode a JAR block PNG into a 16x16 RGBA tile.
+///
+/// Animated textures (water, lava, fire, ...) are stored as a vertical strip
+/// of square frames rather than one image, so a naive resize would squash the
+/// whole animation into one tile; take the first frame instead.
+fn decode_jar_tile(png: &[u8]) -> Option<Vec<u8>> {
+    let img = image::load_from_memory(png).ok()?;
+    let (w, h) = (img.width(), img.height());
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let frame = if h > w { img.crop_imm(0, 0, w, w) } else { img };
+    let raw = frame
+        .resize_exact(16, 16, image::imageops::FilterType::Nearest)
+        .to_rgba8()
+        .into_raw();
+    (raw.len() == 16 * 16 * 4).then_some(raw)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The atlas and the prototype exporter each decide tinting from their own
+    /// list, and the two drifted: `bush` and `leaf_litter` were added to the
+    /// atlas list only, so the same block came out green when drawn from the
+    /// atlas and colourless when drawn as a prototype. Any name either list
+    /// tints, both must tint, and to the same colour.
+    #[test]
+    fn both_tint_tables_agree() {
+        // Every name mentioned by either table, checked in both directions.
+        const NAMES: &[&str] = &[
+            "grass_block_top", "grass_block_side_overlay", "grass_block_side",
+            "short_grass", "fern", "tall_grass_top", "tall_grass_bottom",
+            "large_fern_top", "large_fern_bottom", "melon_stem", "pumpkin_stem",
+            "attached_melon_stem", "attached_pumpkin_stem",
+            "oak_leaves", "birch_leaves", "acacia_leaves", "dark_oak_leaves",
+            "mangrove_leaves", "spruce_leaves", "jungle_leaves", "cherry_leaves",
+            "vine", "bush", "leaf_litter", "lily_pad", "firefly_bush", "pale_oak_leaves", "azalea_leaves",
+            "moss_block", "sugar_cane", "dirt", "stone",
+        ];
+        // The two tables read different images, so they are allowed to differ
+        // where those images differ. Every entry needs a measured reason.
+        //
+        // `pale_oak_leaves`: grayscale in the client JAR (spread 10/255) but
+        // already coloured in this atlas (spread 0.029), so only the prototype
+        // path, which uses the JAR, may tint it.
+        const MEASURED_EXCEPTIONS: &[&str] = &["pale_oak_leaves"];
+
+        let mut disagree = Vec::new();
+        for name in NAMES {
+            if MEASURED_EXCEPTIONS.contains(name) {
+                continue;
+            }
+            let atlas = tint_for_atlas_swatch(name);
+            let proto = crate::texture::biome_tint(name);
+            if atlas != proto {
+                disagree.push(format!("{name}: atlas={atlas:?} prototype={proto:?}"));
+            }
+        }
+        assert!(
+            disagree.is_empty(),
+            "tint tables disagree, so the same block renders differently \
+             depending on which path draws it:\n  {}",
+            disagree.join("\n  "),
+        );
+    }
+
+    /// Tinting multiplies a grayscale tile by a biome colour. Applying it to a
+    /// tile that already ships coloured double-darkens it, and *skipping* a
+    /// grayscale one leaves it rendering as flat gray (this is why `bush` and
+    /// `leaf_litter` came out as white blobs). Neither is visible in the code
+    /// itself, so derive the expectation from the atlas pixels: every tinted
+    /// tile must actually be grayscale.
+    /// Filling a block from the client JAR appends rows to the atlas, which
+    /// changes its height — and therefore the V coordinate of *every* tile,
+    /// including ones resolved from the baked-in table. The UVs must be
+    /// computed against the final height, not the table's fixed-height
+    /// constant, or adding one new block silently slides every existing
+    /// texture up the image.
+    #[test]
+    fn appending_jar_tiles_keeps_existing_uvs_pointing_at_the_same_pixels() {
+        let base = build_mineways_tileset(&["minecraft:stone".to_owned()]);
+        let base_h = base.atlas.height;
+        let stone_uv = base.face_uv("minecraft:stone", 0);
+
+        // `sulfur` is absent from terrainExt.png, so this run has to append.
+        let extended = build_mineways_tileset(&[
+            "minecraft:stone".to_owned(),
+            "minecraft:sulfur".to_owned(),
+        ]);
+        if extended.atlas.height == base_h {
+            return; // no client JAR on this machine; nothing was appended
+        }
+        assert!(extended.atlas.height > base_h, "atlas should have grown");
+
+        // Same tile, taller image => same pixel row, so V must have shrunk in
+        // exact proportion to the height increase.
+        let scale = f64::from(base_h) / f64::from(extended.atlas.height);
+        let stone_uv2 = extended.face_uv("minecraft:stone", 0);
+        for i in [1usize, 3] {
+            let expected = f64::from(stone_uv[i]) * scale;
+            assert!(
+                (f64::from(stone_uv2[i]) - expected).abs() < 1e-6,
+                "stone V[{i}] became {} but should be {expected} after the atlas \
+                 grew from {base_h} to {} — existing UVs were not rescaled",
+                stone_uv2[i],
+                extended.atlas.height
+            );
+        }
+
+        // And the appended block must land on a real, non-empty tile.
+        let sulfur_uv = extended.face_uv("minecraft:sulfur", 0);
+        assert!(
+            sulfur_uv[3] > f32::EPSILON && sulfur_uv != [0.0, 0.0, 1.0, 1.0],
+            "sulfur did not get its own tile: {sulfur_uv:?}"
+        );
+    }
+
+    #[test]
+    fn every_tinted_swatch_is_actually_grayscale() {
+        let (pixels, width, height) = load_terrain_atlas().unwrap();
+        for &(col, row, name) in TILE_TABLE.iter() {
+            if tint_for_atlas_swatch(name).is_none() {
+                continue;
+            }
+            let (mut acc, mut n) = ([0f32; 3], 0f32);
+            for y in row * 16..row * 16 + 16 {
+                for x in col * 16..col * 16 + 16 {
+                    if x >= width || y >= height {
+                        continue;
+                    }
+                    let i = ((y * width + x) * 4) as usize;
+                    if pixels[i + 3] < 128 {
+                        continue;
+                    }
+                    for c in 0..3 {
+                        acc[c] += f32::from(pixels[i + c]);
+                    }
+                    n += 1.0;
+                }
+            }
+            assert!(n > 0.0, "{name}: tinted tile ({col},{row}) is empty");
+            let avg = acc.map(|v| v / n / 255.0);
+            let spread = (avg[0] - avg[1])
+                .abs()
+                .max((avg[1] - avg[2]).abs())
+                .max((avg[0] - avg[2]).abs());
+            assert!(
+                spread < 0.02,
+                "{name} at ({col},{row}) averages {avg:?} (spread {spread:.3}) — it already \
+                 carries colour, so multiplying a biome tint over it double-darkens the tile"
+            );
+        }
+    }
+
+    #[test]
+    fn tint_only_touches_grayscale_swatches_not_grass_side() {
+        let (mut pixels, width, height) = load_terrain_atlas().unwrap();
+
+        let tile_avg = |pixels: &[u8], col: u32, row: u32| -> [u8; 3] {
+            let (mut r, mut g, mut b, mut n) = (0u32, 0u32, 0u32, 0u32);
+            for y in (row * 16)..(row * 16 + 16) {
+                for x in (col * 16)..(col * 16 + 16) {
+                    let idx = ((y * width + x) * 4) as usize;
+                    r += u32::from(pixels[idx]);
+                    g += u32::from(pixels[idx + 1]);
+                    b += u32::from(pixels[idx + 2]);
+                    n += 1;
+                }
+            }
+            [(r / n) as u8, (g / n) as u8, (b / n) as u8]
+        };
+
+        // grass_block_side (3, 0) is a pre-coloured dirt+strip composite,
+        // not grayscale — must be untouched by tinting.
+        let side_before = tile_avg(&pixels, 3, 0);
+        // grass_block_top (0, 0) IS grayscale — must change (darken/green).
+        let top_before = tile_avg(&pixels, 0, 0);
+
+        tint_biome_swatches(&mut pixels, width, height);
+
+        let side_after = tile_avg(&pixels, 3, 0);
+        let top_after = tile_avg(&pixels, 0, 0);
+
+        assert_eq!(side_before, side_after, "grass_block_side must not be tinted");
+        assert_ne!(top_before, top_after, "grass_block_top must be tinted");
+    }
+
+    /// The swatch table is positional, so it only means anything paired with
+    /// the `terrainExt.png` revision it was generated from. When the two drift
+    /// apart, lookups still succeed but land on whatever tile now occupies
+    /// that slot — deepslate came out white, tuff diamond-blue, calcite slate,
+    /// while low-index blocks like stone and dirt stayed correct and hid the
+    /// problem. Checks a few high-index swatches against an independent colour
+    /// source so a mismatched regeneration fails here instead of in a render.
+    #[test]
+    fn swatch_table_matches_the_bundled_atlas() {
+        let (pixels, width, height) = load_terrain_atlas().unwrap();
+        assert_eq!(
+            height as usize,
+            (TILE_TABLE.iter().map(|t| t.1).max().unwrap() as usize + 1) * 16,
+            "atlas height and table row count disagree — regenerate with tools/gen_mineways_data.py"
+        );
+
+        let tile_avg = |col: u32, row: u32| -> [f32; 3] {
+            let (mut acc, mut n) = ([0f32; 3], 0f32);
+            for y in row * 16..row * 16 + 16 {
+                for x in col * 16..col * 16 + 16 {
+                    let i = ((y * width + x) * 4) as usize;
+                    if pixels[i + 3] < 128 {
+                        continue;
+                    }
+                    for c in 0..3 {
+                        acc[c] += f32::from(pixels[i + c]);
+                    }
+                    n += 1.0;
+                }
+            }
+            acc.map(|v| if n == 0.0 { 0.0 } else { v / n / 255.0 })
+        };
+
+        // High-index blocks: these are the ones a stale table gets wrong.
+        for block in ["deepslate", "tuff", "calcite", "andesite", "granite"] {
+            let faces = get_swatch_for_block(block, None)
+                .unwrap_or_else(|| panic!("{block} has no swatch"));
+            let (col, row, _) = TILE_TABLE[faces[2]];
+            let got = tile_avg(col, row);
+            let want = crate::blocks::block_color(block);
+            let delta: f32 = (0..3).map(|c| (got[c] - want[c]).abs()).sum();
+            assert!(
+                delta < 0.45,
+                "{block}: atlas tile ({col},{row}) is {got:?} but should look like \
+                 {want:?} (delta {delta:.2}) — swatch table and terrainExt.png are \
+                 out of sync; regenerate with tools/gen_mineways_data.py"
+            );
+        }
+    }
+
+    #[test]
+    fn pillar_face_remap_is_identity_for_vertical_axis() {
+        for face in 0..6 {
+            assert_eq!(remap_pillar_face(face, "y"), face);
+            assert_eq!(remap_pillar_face(face, "unknown"), face);
+        }
+    }
+
+    #[test]
+    fn pillar_face_remap_moves_end_grain_for_horizontal_axis() {
+        // axis=x: end-grain belongs on the east/west faces (2, 3), not top/bottom (0, 1).
+        assert_eq!(remap_pillar_face(2, "x"), 0);
+        assert_eq!(remap_pillar_face(3, "x"), 1);
+        for bark_face in [0, 1, 4, 5] {
+            assert_eq!(remap_pillar_face(bark_face, "x"), 2);
+        }
+
+        // axis=z: end-grain belongs on the south/north faces (4, 5).
+        assert_eq!(remap_pillar_face(4, "z"), 0);
+        assert_eq!(remap_pillar_face(5, "z"), 1);
+        for bark_face in [0, 1, 2, 3] {
+            assert_eq!(remap_pillar_face(bark_face, "z"), 2);
+        }
+    }
 
     #[test]
     fn atlas_loads_successfully() {

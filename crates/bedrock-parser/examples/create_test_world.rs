@@ -75,6 +75,29 @@ struct BlockStates {
 struct PaletteEntry {
     #[serde(rename = "Name")]
     name: String,
+    #[serde(rename = "Properties", skip_serializing_if = "Option::is_none")]
+    properties: Option<HashMap<String, String>>,
+}
+
+/// A block placement: its namespaced name plus an optional `axis` property
+/// (used to test horizontally-placed logs/pillars, whose end-grain and bark
+/// textures must land on different faces than a vertical log).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct PlacedBlock {
+    name: &'static str,
+    axis: Option<&'static str>,
+    /// `half` state for two-tall plants (`lower`/`upper`).
+    half: Option<&'static str>,
+}
+
+impl PlacedBlock {
+    const fn simple(name: &'static str) -> Self {
+        Self { name, axis: None, half: None }
+    }
+
+    const fn pillar(name: &'static str, axis: &'static str) -> Self {
+        Self { name, axis: Some(axis), half: None }
+    }
 }
 
 fn main() {
@@ -113,44 +136,135 @@ fn write_level_dat(path: &PathBuf) {
 }
 
 /// Terrain generator: returns the block at world (x, y, z).
-fn block_at(x: i32, y: i32, z: i32) -> &'static str {
+fn block_at(x: i32, y: i32, z: i32) -> PlacedBlock {
     // House: floor 8..13 × 8..13, walls up to y 66, at world x/z 8..13.
     let in_house = (8..13).contains(&x) && (8..13).contains(&z);
     if in_house && y == 62 {
-        return "minecraft:oak_planks";
+        return PlacedBlock::simple("minecraft:oak_planks");
     }
     if in_house && (63..67).contains(&y) {
         let wall = x == 8 || x == 12 || z == 8 || z == 12;
         if wall {
             // Door gap on the south side, glass windows on the others.
             if z == 8 && x == 10 && y <= 64 {
-                return "minecraft:air";
+                return PlacedBlock::simple("minecraft:air");
             }
             if y == 64 && ((x == 8 || x == 12) && (9..12).contains(&z) || z == 12 && x == 10) {
-                return "minecraft:glass";
+                return PlacedBlock::simple("minecraft:glass");
             }
-            return "minecraft:stone_bricks";
+            return PlacedBlock::simple("minecraft:stone_bricks");
         }
         if y == 66 && x == 10 && z == 10 {
-            return "minecraft:glowstone";
+            return PlacedBlock::simple("minecraft:glowstone");
         }
-        return "minecraft:air";
+        return PlacedBlock::simple("minecraft:air");
     }
     if in_house && y > 62 {
-        return "minecraft:air";
+        return PlacedBlock::simple("minecraft:air");
     }
     // A tree at (4, 4).
     if x == 4 && z == 4 && (63..67).contains(&y) {
-        return "minecraft:oak_log";
+        return PlacedBlock::simple("minecraft:oak_log");
     }
     if (2..7).contains(&x) && (2..7).contains(&z) && (65..68).contains(&y) {
-        return "minecraft:oak_leaves";
+        return PlacedBlock::simple("minecraft:oak_leaves");
     }
+
+    // --- Bug-repro test rig (block-ID / axis / alpha / tint / meshswap) ---
+
+    // A vertical birch log (axis=y, the common case) at (20, 63..66, 20).
+    if x == 20 && z == 20 && (63..66).contains(&y) {
+        return PlacedBlock::pillar("minecraft:birch_log", "y");
+    }
+    // A horizontal birch log lying on its side (axis=x) at y=64, x 22..25.
+    if (22..25).contains(&x) && z == 20 && y == 64 {
+        return PlacedBlock::pillar("minecraft:birch_log", "x");
+    }
+    // A horizontal birch log lying on its side (axis=z) at y=64, z 22..25.
+    if x == 20 && (22..25).contains(&z) && y == 64 {
+        return PlacedBlock::pillar("minecraft:birch_log", "z");
+    }
+    // Birch leaves canopy (alpha cutout + biome tint test) above the vertical log.
+    if (18..23).contains(&x) && (18..23).contains(&z) && (66..69).contains(&y) {
+        return PlacedBlock::simple("minecraft:birch_leaves");
+    }
+    // A torch and a chest (MCprep meshswap test blocks).
+    if x == 25 && z == 20 && y == 63 {
+        return PlacedBlock::simple("minecraft:torch");
+    }
+    if x == 26 && z == 20 && y == 63 {
+        return PlacedBlock::simple("minecraft:chest");
+    }
+    // A small water pool (alpha blend / translucency test).
+    if (28..31).contains(&x) && (28..31).contains(&z) && y == 62 {
+        return PlacedBlock::simple("minecraft:water");
+    }
+    // A dandelion (small swappable-plant test, and biome-tint-adjacent).
+    if x == 27 && z == 27 && y == 63 {
+        return PlacedBlock::simple("minecraft:dandelion");
+    }
+    // ── Shape test rig ────────────────────────────────────────────────
+    // One of each block reported as rendering wrong, exposed on flat grass
+    // at z=30 so every shape can be inspected side by side.
+    if z == 30 && y == 63 {
+        let specimen = match x {
+            40 => Some("minecraft:bush"),
+            42 => Some("minecraft:firefly_bush"),
+            44 => Some("minecraft:leaf_litter"),
+            46 => Some("minecraft:red_mushroom"),
+            48 => Some("minecraft:brown_mushroom"),
+            50 => Some("minecraft:amethyst_cluster"),
+            52 => Some("minecraft:short_grass"),
+            54 => Some("minecraft:dandelion"),
+            56 => Some("minecraft:poppy"),
+            58 => Some("minecraft:torch"),
+            60 => Some("minecraft:oak_fence"),
+            62 => Some("minecraft:sugar_cane"),
+            _ => None,
+        };
+        if let Some(name) = specimen {
+            return PlacedBlock::simple(name);
+        }
+    }
+    // Two-tall plants need both halves placed.
+    if z == 32 && (63..65).contains(&y) {
+        let half = if y == 63 { "lower" } else { "upper" };
+        let specimen = match x {
+            40 => Some("minecraft:peony"),
+            42 => Some("minecraft:lilac"),
+            44 => Some("minecraft:tall_grass"),
+            _ => None,
+        };
+        if let Some(name) = specimen {
+            return PlacedBlock {
+                name,
+                axis: None,
+                half: Some(half),
+            };
+        }
+    }
+    // Ground under the rig.
+    if (z == 30 || z == 32) && (38..64).contains(&x) && y == 62 {
+        return PlacedBlock::simple("minecraft:grass_block");
+    }
+
+    // Blocks that postdate Mineways' bundled terrainExt.png, placed exposed
+    // so their textures have to come from the client JAR at export time.
+    if x == 34 && z == 20 && (63..66).contains(&y) {
+        return PlacedBlock::simple("minecraft:sulfur");
+    }
+    if x == 36 && z == 20 && (63..66).contains(&y) {
+        return PlacedBlock::simple("minecraft:cinnabar");
+    }
+    if x == 38 && z == 20 && (63..66).contains(&y) {
+        return PlacedBlock::simple("minecraft:potent_sulfur");
+    }
+
     match y {
-        48..=59 => "minecraft:stone",
-        60..=61 => "minecraft:dirt",
-        62 => "minecraft:grass_block",
-        _ => "minecraft:air",
+        48..=59 => PlacedBlock::simple("minecraft:stone"),
+        60..=61 => PlacedBlock::simple("minecraft:dirt"),
+        62 => PlacedBlock::simple("minecraft:grass_block"),
+        _ => PlacedBlock::simple("minecraft:air"),
     }
 }
 
@@ -158,15 +272,15 @@ fn block_at(x: i32, y: i32, z: i32) -> &'static str {
 fn chunk_nbt(cx: i32, cz: i32) -> ChunkNbt {
     let mut sections = Vec::new();
     for section_y in [3i8, 4] {
-        let mut palette: Vec<String> = Vec::new();
-        let mut palette_ids: HashMap<&str, u16> = HashMap::new();
+        let mut palette: Vec<PlacedBlock> = Vec::new();
+        let mut palette_ids: HashMap<PlacedBlock, u16> = HashMap::new();
         let mut indices = vec![0u16; 4096];
         for y in 0..16i32 {
             for z in 0..16i32 {
                 for x in 0..16i32 {
-                    let name = block_at(cx * 16 + x, i32::from(section_y) * 16 + y, cz * 16 + z);
-                    let id = *palette_ids.entry(name).or_insert_with(|| {
-                        palette.push(name.to_owned());
+                    let block = block_at(cx * 16 + x, i32::from(section_y) * 16 + y, cz * 16 + z);
+                    let id = *palette_ids.entry(block).or_insert_with(|| {
+                        palette.push(block);
                         (palette.len() - 1) as u16
                     });
                     indices[(y as usize) << 8 | (z as usize) << 4 | x as usize] = id;
@@ -184,7 +298,19 @@ fn chunk_nbt(cx: i32, cz: i32) -> ChunkNbt {
             block_states: BlockStates {
                 palette: palette
                     .into_iter()
-                    .map(|name| PaletteEntry { name })
+                    .map(|block| PaletteEntry {
+                        name: block.name.to_owned(),
+                        properties: {
+                            let mut props = HashMap::new();
+                            if let Some(axis) = block.axis {
+                                props.insert("axis".to_owned(), axis.to_owned());
+                            }
+                            if let Some(half) = block.half {
+                                props.insert("half".to_owned(), half.to_owned());
+                            }
+                            (!props.is_empty()).then_some(props)
+                        },
+                    })
                     .collect(),
                 data: fastnbt::LongArray::new(data),
             },

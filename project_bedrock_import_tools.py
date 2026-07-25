@@ -18,10 +18,494 @@ bl_info = {
 
 import bpy
 import os
-from pathlib import Path
+import json
+import math
 from bpy_extras.io_utils import ImportHelper
 from bpy.types import Operator
 from bpy.props import StringProperty, BoolProperty, EnumProperty
+
+# ---------------------------------------------------------------------------
+# Tier 1: place real MCprep 3D assets from the exporter's block manifest
+# ---------------------------------------------------------------------------
+
+# Block id -> asset name in mcprep_meshSwap.blend, for the cases where the two
+# don't already match. Everything not listed here is looked up by its own name
+# (as a collection first, then an object), so this stays small on purpose.
+# Blocks placed one block *above* their recorded position. MCprep has no
+# `grass_block` asset — its `grass`/`short_grass`/`colormap/grass` objects are
+# all the same grass-tuft mesh, meant to sit on top of the block rather than
+# replace it. The block itself stays as exported geometry (a cube genuinely is
+# the right shape for it); the tuft is what makes the surface read as grass.
+MESHSWAP_OFFSETS = {
+    "grass_block": (0.0, 0.0, 1.0),
+}
+
+# Blocks whose exported geometry must be *kept* even though an asset is placed
+# for them — the asset augments the block instead of replacing it.
+#
+# This only holds for an asset placed at an offset, like a grass tuft sitting
+# on top of a grass block. An asset placed at the block's own position is a
+# replacement: keeping the exported cube as well leaves two coincident cubes
+# that z-fight, which shows up as hard stripes banding across the terrain.
+MESHSWAP_AUGMENTS_ONLY = {"grass_block"}
+
+# Name prefix for the instance-source meshes the exporter's prototypes become.
+PROTOTYPE_PREFIX = "PROTO_"
+
+# Blocks whose geometry is flat or near-flat, and which must not cast shadows.
+#
+# A zero-thickness plane still casts a full shadow, so ground cover and
+# surface decoration paint hard dark smears across the block beneath them —
+# nothing like the game, where these are drawn as unlit decoration. Set on the
+# prototype source object, which propagates to every instance of it.
+NO_SHADOW_BLOCKS = {
+    "leaf_litter",
+    "moss_carpet",
+    "glow_lichen",
+    "vine",
+    "lily_pad",
+    "rail",
+    "powered_rail",
+    "seagrass",
+    "short_grass",
+    "fern",
+}
+
+
+def hide_meshswap_helpers():
+    """Stop MCprep's non-renderable helper objects from showing up.
+
+    `bpy.ops.mcprep.meshswap` spawns particle-emitter helpers alongside the
+    blocks it swaps -- torch flame and smoke sources, named with a `noImport`
+    suffix in the meshswap library. They are meant to drive particle systems,
+    not to be drawn: each carries a flame *animation strip* mapped across a
+    single quad, so a visible one renders as a column of garbled colour that
+    reads as a stray broken torch floating in the scene.
+
+    Unlinking rather than deleting keeps them available as data for whatever
+    references them.
+
+    Returns the number of helpers hidden.
+    """
+    # `noImport` is MCprep's explicit marker, but the particle sources it
+    # spawns alongside a swapped block are named `<asset>.flame` / `.smoke`
+    # and carry no marker at all. Both families render as stray garbled
+    # torches, so match on either.
+    def is_helper(name):
+        low = name.lower()
+        if "noimport" in low:
+            return True
+        # Strip Blender's `.001` duplicate suffix before testing the stem.
+        stem = low.rsplit(".", 1)
+        if len(stem) == 2 and stem[1].isdigit():
+            low = stem[0]
+        return low.endswith((".flame", ".smoke"))
+
+    hidden = 0
+    for ob in list(bpy.data.objects):
+        if not is_helper(ob.name):
+            continue
+        if not ob.users_collection:
+            continue
+        for coll in list(ob.users_collection):
+            coll.objects.unlink(ob)
+        ob.use_fake_user = True
+        hidden += 1
+    return hidden
+
+
+def set_pixelated_filtering():
+    """Force nearest-neighbour sampling on every image texture in the file.
+
+    Minecraft textures are 16x16; Blender's default Linear interpolation
+    blends neighbouring texels and turns block faces into smeared mush,
+    which is the single most obvious way an import stops looking like the
+    game. This runs over `bpy.data` rather than a selection, and last, on
+    purpose: MCprep's `prep_materials` rebuilds each material's node graph
+    from scratch, so interpolation set before it runs is silently discarded.
+
+    Returns the number of texture nodes changed.
+    """
+    changed = 0
+    for mat in bpy.data.materials:
+        if not mat.use_nodes or not mat.node_tree:
+            continue
+        for node in mat.node_tree.nodes:
+            if node.type != 'TEX_IMAGE':
+                continue
+            if node.interpolation != 'Closest':
+                node.interpolation = 'Closest'
+                changed += 1
+    # Node groups (MCprep builds some of its shading inside them) hold their
+    # own texture nodes, which the material loop above never reaches.
+    for group in bpy.data.node_groups:
+        for node in group.nodes:
+            if node.type == 'TEX_IMAGE' and node.interpolation != 'Closest':
+                node.interpolation = 'Closest'
+                changed += 1
+    return changed
+
+MESHSWAP_ALIASES = {
+    "grass": "short_grass",
+    "tall_grass": "tall_grass_bottom",
+    "large_fern": "fern",
+    "sunflower": "sunflower_bottom",
+    "cactus": "cactus_side",
+    "wheat": "wheat_stage7",
+    "carrots": "carrots_stage3",
+    "potatoes": "potatoes_stage3",
+    "cobweb": "cobweb",
+    "dead_bush": "dead_bush",
+    "brown_mushroom": "brown_mushroom",
+    "red_mushroom": "red_mushroom",
+    "sugar_cane": "sugar_cane",
+    "lily_pad": "lily_pad",
+    "ladder": "ladder",
+    "rail": "rail",
+    "powered_rail": "powered_rail",
+    "vine": "vine",
+    "torch": "torch",
+    "wall_torch": "torch",
+    "redstone_torch": "redstone_torch",
+    "chest": "chest",
+    "trapped_chest": "chest",
+    "glowstone": "glowstone",
+    "sea_lantern": "sea_lantern",
+    "lantern": "lantern",
+    "shroomlight": "shroomlight",
+    "spawner": "spawner",
+    "bookshelf": "bookshelf",
+    "crafting_table": "crafting_table_top",
+    "enchanting_table": "enchanting_table_top",
+    "furnace": "furnace_front",
+    "jack_o_lantern": "jack_o_lantern",
+    "carved_pumpkin": "carved_pumpkin",
+    "redstone_lamp": "redstone_lamp",
+    "fire": "fire",
+    "soul_fire": "soul_fire",
+    "soul_torch": "soul_torch",
+    "soul_lantern": "soul_lantern",
+}
+
+
+def _meshswap_blend_path():
+    """Absolute path to MCprep's meshswap asset library, or None."""
+    try:
+        prefs = bpy.context.preferences.addons.get("MCprep_addon")
+        if prefs is not None:
+            path = bpy.path.abspath(getattr(bpy.context.scene, "meshswap_path", "") or "")
+            if path and os.path.isfile(path):
+                return path
+        import addon_utils
+        for mod in addon_utils.modules():
+            if mod.__name__ == "MCprep_addon":
+                candidate = os.path.join(
+                    os.path.dirname(mod.__file__),
+                    "MCprep_resources",
+                    "mcprep_meshSwap.blend",
+                )
+                if os.path.isfile(candidate):
+                    return candidate
+    except Exception:
+        pass
+    return None
+
+
+def _meshswap_contents(blend_path):
+    """(collections, objects) available in the meshswap library."""
+    with bpy.data.libraries.load(blend_path, link=False) as (src, _dst):
+        return set(src.collections), set(src.objects)
+
+
+def _append_meshswap_asset(blend_path, name, is_collection):
+    """Append one asset by name and return the datablock (or None).
+
+    Identifies the result by diffing the datablock list rather than looking it
+    up by name afterwards. The OBJ import names its objects after block types
+    (`short_grass`, `dandelion`, `vine`, ...), which collides with the asset
+    names in the meshswap library — Blender then renames the incoming asset to
+    `short_grass.001`, and a name lookup silently returns the OBJ's own mesh
+    instead of the asset just appended.
+    """
+    store = bpy.data.collections if is_collection else bpy.data.objects
+    before = set(store.keys())
+    with bpy.data.libraries.load(blend_path, link=False) as (src, dst):
+        available = src.collections if is_collection else src.objects
+        if name not in available:
+            return None
+        if is_collection:
+            dst.collections = [name]
+        else:
+            dst.objects = [name]
+    added = [key for key in store.keys() if key not in before]
+    if not added:
+        # Already present from an earlier import; reuse it.
+        return store.get(name)
+    # Prefer the block that actually came from this append.
+    chosen = None
+    for key in added:
+        if key == name or key.startswith(f"{name}."):
+            chosen = store[key]
+            break
+    if chosen is None:
+        chosen = store[added[0]]
+
+    # Appending one object drags its dependencies in with it: MCprep's torch
+    # brings flame and smoke helpers (named with a `noImport` suffix, plus
+    # `*.flame` / `*.smoke` particle sources). Blender links those into the
+    # scene, where they render as stray torches whose animation-strip textures
+    # are mapped whole -- a column of garbled colour. Only the asset we asked
+    # for should be visible; the helpers stay as data for it to reference.
+    if not is_collection:
+        for key in added:
+            extra = store.get(key)
+            if extra is None or extra is chosen or not hasattr(extra, "users_collection"):
+                continue
+            for coll in list(extra.users_collection):
+                coll.objects.unlink(extra)
+            extra.use_fake_user = True
+
+    return chosen
+
+
+def _build_instancer_node_group(name, asset, is_collection):
+    """Geometry node group: instance `asset` on every point of the input mesh.
+
+    Instancing rather than duplicating real objects is what makes this scale —
+    a selection can easily hold six figures of plants, and one instanced point
+    cloud per block type stays cheap where that many separate objects would
+    not.
+    """
+    group = bpy.data.node_groups.new(name, "GeometryNodeTree")
+    group.interface.new_socket("Geometry", in_out='INPUT', socket_type='NodeSocketGeometry')
+    group.interface.new_socket("Geometry", in_out='OUTPUT', socket_type='NodeSocketGeometry')
+
+    nodes, links = group.nodes, group.links
+    n_in = nodes.new("NodeGroupInput")
+    n_in.location = (-400, 0)
+    n_out = nodes.new("NodeGroupOutput")
+    n_out.location = (400, 0)
+    iop = nodes.new("GeometryNodeInstanceOnPoints")
+    iop.location = (100, 0)
+
+    if is_collection:
+        info = nodes.new("GeometryNodeCollectionInfo")
+        info.location = (-200, -150)
+        info.inputs["Collection"].default_value = asset
+        # Keep the collection's internal layout; pick one child at random only
+        # if the library offers variants (torches do).
+        if "Separate Children" in info.inputs:
+            info.inputs["Separate Children"].default_value = False
+        if "Reset Children" in info.inputs:
+            info.inputs["Reset Children"].default_value = True
+    else:
+        info = nodes.new("GeometryNodeObjectInfo")
+        info.location = (-200, -150)
+        info.inputs["Object"].default_value = asset
+        if "As Instance" in info.inputs:
+            info.inputs["As Instance"].default_value = True
+
+    # Collection Info outputs "Instances"; Object Info outputs "Geometry".
+    source = info.outputs.get("Geometry") or info.outputs.get("Instances")
+    links.new(n_in.outputs[0], iop.inputs["Points"])
+    links.new(source, iop.inputs["Instance"])
+    links.new(iop.outputs["Instances"], n_out.inputs[0])
+    return group
+
+
+def _load_prototype(prototypes_dir, block_name):
+    """Import `prototypes/<block>.obj` and return it as an instancing source.
+
+    The exporter writes one of these per block type: that block's true vanilla
+    geometry, textured from named PNGs taken straight out of the player's
+    client JAR. Instancing it beats drawing the block from the shared atlas —
+    nothing is shared, so no neighbouring tile can bleed along an edge, and a
+    texture is found by name rather than by position in a table that can drift
+    out of step with the atlas image.
+    """
+    path = os.path.join(prototypes_dir, f"{block_name}.obj")
+    if not os.path.isfile(path):
+        return None
+    before = set(bpy.data.objects.keys())
+    try:
+        # Import the raw file and rotate it here rather than asking the
+        # importer to convert axes. The up_axis/forward_axis arguments are
+        # honoured for the world OBJ but silently ignored on this call, which
+        # left every prototype lying on its side: Minecraft's top and bottom
+        # faces (constant Y) came in as Blender side faces, and its north and
+        # south faces pointed up and down. Doing the conversion explicitly
+        # cannot be ignored.
+        bpy.ops.wm.obj_import(filepath=path, forward_axis='Y', up_axis='Z')
+    except Exception:
+        return None
+    added = [k for k in bpy.data.objects.keys() if k not in before]
+    if not added:
+        return None
+
+    parts = [bpy.data.objects[k] for k in added]
+    # A block whose faces use several textures imports as several objects;
+    # join them so one instance carries the whole block.
+    proto = parts[0]
+    if len(parts) > 1:
+        bpy.ops.object.select_all(action='DESELECT')
+        for part in parts:
+            part.select_set(True)
+        bpy.context.view_layer.objects.active = proto
+        try:
+            bpy.ops.object.join()
+        except Exception:
+            pass
+    # Minecraft Y-up -> Blender Z-up: (x, y, z) -> (x, -z, y), which is a
+    # +90 degree turn about X. Applied to the mesh so the instancer sees an
+    # already-upright block and needs no per-instance rotation.
+    proto.rotation_euler = (math.radians(90.0), 0.0, 0.0)
+    bpy.context.view_layer.objects.active = proto
+    try:
+        bpy.ops.object.transform_apply(location=False, rotation=True, scale=False)
+    except Exception:
+        pass
+
+    proto.name = f"{PROTOTYPE_PREFIX}{block_name}"
+    if block_name in NO_SHADOW_BLOCKS:
+        proto.visible_shadow = False
+    # Source only — it must not render on its own.
+    for coll in list(proto.users_collection):
+        coll.objects.unlink(proto)
+    proto.use_fake_user = True
+    return proto
+
+
+def instance_blocks_from_manifest(context, manifest_path, report=None, grass_tufts=False):
+    """Place MCprep 3D assets at every position the manifest lists.
+
+    Returns (placed_counts, skipped_names).
+    """
+    blend_path = _meshswap_blend_path()
+    if not blend_path:
+        if report:
+            report({'WARNING'}, "MCprep meshswap library not found — skipping block instancing")
+        return {}, []
+
+    with open(manifest_path, encoding="utf-8") as handle:
+        manifest = json.load(handle)
+
+    aliases = dict(MESHSWAP_ALIASES)
+    if grass_tufts:
+        # Opt-in: scatter MCprep's grass tuft over every grass block. Vanilla
+        # only grows grass on *some* blocks, so applying it to all of them
+        # reads as much denser than the game does.
+        aliases["grass_block"] = "grass"
+
+    collections, objects = _meshswap_contents(blend_path)
+    root = bpy.data.collections.get("Bedrock Instances") or bpy.data.collections.new(
+        "Bedrock Instances"
+    )
+    if root.name not in context.scene.collection.children:
+        context.scene.collection.children.link(root)
+
+    prototypes_dir = os.path.join(os.path.dirname(manifest_path), "prototypes")
+    placed, skipped, failed, from_prototype = {}, [], [], []
+    for block_name, variants in manifest.get("blocks", {}).items():
+      # One asset that won't load must not cost every later block its swap.
+      try:
+            asset_name = aliases.get(block_name, block_name)
+            is_collection = asset_name in collections
+            use_prototype = not is_collection and asset_name not in objects
+            if use_prototype and not os.path.isdir(prototypes_dir):
+                skipped.append(block_name)
+                continue
+
+            # Two-tall plants (tall_grass, peony, lilac, sunflower) occupy two
+            # blocks but the library asset models the whole plant, so placing at
+            # both halves would stack two copies. Keep the lower half only.
+            coords = []
+            for variant in variants:
+                if variant.get("properties", {}).get("half") == "upper":
+                    continue
+                # The offset exists to sit an augmenting asset on top of its
+                # block -- a grass tuft above a grass block. A prototype *is*
+                # the block, so lifting it leaves the whole terrain floating a
+                # block too high, with a gap where each block should have been.
+                if use_prototype:
+                    ox, oy, oz = 0.0, 0.0, 0.0
+                else:
+                    ox, oy, oz = MESHSWAP_OFFSETS.get(block_name, (0.0, 0.0, 0.0))
+                for x, y, z in variant["positions"]:
+                    # Manifest is Minecraft-space (Y-up), matching the OBJ's own
+                    # vertices; the importer brings the OBJ in with up_axis='Y',
+                    # forward_axis='NEGATIVE_Z', i.e. (x, y, z) -> (x, -z, y).
+                    coords.append((x + ox, -z + oy, y + oz))
+            if not coords:
+                continue
+
+            # Resolve the OBJ's own object for this block type *before* appending:
+            # the asset may share its name, after which a lookup is ambiguous.
+            obj_geometry = bpy.data.objects.get(block_name)
+
+            # An asset only augments the block when it is offset away from it
+            # *and* is not a prototype — a prototype always stands in for the
+            # block itself.
+            augments_block = (
+                block_name in MESHSWAP_AUGMENTS_ONLY
+                and not use_prototype
+                and MESHSWAP_OFFSETS.get(block_name, (0.0, 0.0, 0.0)) != (0.0, 0.0, 0.0)
+            )
+
+            if use_prototype:
+                asset = _load_prototype(prototypes_dir, block_name)
+                if asset is None:
+                    skipped.append(block_name)
+                    continue
+                from_prototype.append(block_name)
+            else:
+                asset = _append_meshswap_asset(blend_path, asset_name, is_collection)
+            if asset is None:
+                skipped.append(block_name)
+                continue
+            # The prototype is only a source for instances — it should not render
+            # in its own right, so keep it out of the scene's collections.
+            if not is_collection:
+                for coll in list(getattr(asset, "users_collection", []) or []):
+                    coll.objects.unlink(asset)
+                asset.use_fake_user = True
+
+            mesh = bpy.data.meshes.new(f"PB_points_{block_name}")
+            mesh.from_pydata(coords, [], [])
+            mesh.update()
+            holder = bpy.data.objects.new(f"PB_{block_name}", mesh)
+            root.objects.link(holder)
+
+            group = _build_instancer_node_group(
+                f"PB_Instancer_{block_name}", asset, is_collection
+            )
+            modifier = holder.modifiers.new("PB_Instancer", 'NODES')
+            modifier.node_group = group
+
+            # The OBJ already contains geometry for this block type; leaving it
+            # in place would z-fight with the asset just placed — unless the
+            # asset only *augments* the block (grass tufts sitting on top of a
+            # grass block), in which case the block's own geometry must stay.
+            if (
+                obj_geometry is not None
+                and obj_geometry is not holder
+                and obj_geometry is not asset
+                and not augments_block
+            ):
+                bpy.data.objects.remove(obj_geometry, do_unlink=True)
+
+            placed[block_name] = len(coords)
+      except Exception as exc:
+            failed.append(f"{block_name} ({exc})")
+
+    if from_prototype:
+        print(
+            f"  {len(from_prototype)} block type(s) used exporter prototypes "
+            f"(real geometry + JAR textures, no atlas): "
+            + ", ".join(sorted(from_prototype))
+        )
+    if failed:
+        print("  Asset placement failed for: " + "; ".join(failed))
+    return placed, skipped
 
 # Swappable block types supported by MCprep 3D library (vegetation, 3D items, containers)
 SWAPPABLE_BLOCKS = {
@@ -31,6 +515,23 @@ SWAPPABLE_BLOCKS = {
     "peony", "wheat", "carrots", "potatoes", "beetroots", "torch", "soul_torch",
     "redstone_torch", "lantern", "soul_lantern", "chest", "trapped_chest",
     "ender_chest", "crafting_table", "furnace", "blast_furnace", "smoker",
+}
+
+# Biome tint (grass/leaves/ferns green) is baked directly into the exported
+# atlas per-swatch by the Rust exporter (mineways.rs: tint_biome_swatches),
+# not applied here. A material-level tint in Blender can't distinguish "this
+# face's texture is grayscale and needs tinting" from "this face's texture
+# (e.g. grass_block_side) is already fully coloured" when both faces share
+# one material — tinting the whole material darkens the already-correct one.
+
+# Materials needing alpha cutout transparency.
+ALPHA_MATS = {
+    "oak_leaves", "jungle_leaves", "acacia_leaves", "dark_oak_leaves",
+    "mangrove_leaves", "birch_leaves", "spruce_leaves", "short_grass",
+    "tall_grass", "fern", "vine", "lily_pad", "sugar_cane", "spawner",
+    "glass", "tinted_glass", "seagrass", "tall_seagrass", "dandelion",
+    "poppy", "blue_orchid", "allium", "azure_bluet", "cornflower",
+    "oxeye_daisy", "peony", "pointed_dripstone", "glow_lichen",
 }
 
 # ---------------------------------------------------------------------------
@@ -56,6 +557,45 @@ class IMPORT_OT_project_bedrock(Operator, ImportHelper):
         default=True,
     )
 
+    def prep_prototype_materials(self, context):
+        """Run MCprep's material prep over the prototype meshes.
+
+        The prototypes are the instanced sources, so treating them once fixes
+        every placement of that block type.
+        """
+        if not hasattr(bpy.ops, 'mcprep') or not hasattr(bpy.ops.mcprep, 'prep_materials'):
+            return 0
+        targets = [
+            ob for ob in bpy.data.objects
+            if ob.name.startswith(PROTOTYPE_PREFIX) and ob.type == 'MESH' and ob.data.materials
+        ]
+        if not targets:
+            return 0
+
+        # Prototypes are instance sources, deliberately unlinked from every
+        # collection so they do not render on their own. An object outside the
+        # view layer cannot be selected, and prep_materials works on the
+        # selection -- so link them for the duration and put them back after.
+        scene_coll = context.scene.collection
+        linked = []
+        for ob in targets:
+            if ob.name not in scene_coll.objects:
+                scene_coll.objects.link(ob)
+                linked.append(ob)
+        try:
+            bpy.ops.object.select_all(action='DESELECT')
+            for ob in targets:
+                ob.select_set(True)
+            context.view_layer.objects.active = targets[0]
+            bpy.ops.mcprep.prep_materials('EXEC_DEFAULT')
+        except Exception as e:
+            self.report({'WARNING'}, f"MCprep prep_materials (prototypes) warning: {e}")
+            return 0
+        finally:
+            for ob in linked:
+                scene_coll.objects.unlink(ob)
+        return len(targets)
+
     use_mcprep_materials: BoolProperty(
         name="Use MCprep Prep Materials",
         description="Automatically run MCprep material prep on imported objects if MCprep addon is active",
@@ -66,6 +606,28 @@ class IMPORT_OT_project_bedrock(Operator, ImportHelper):
         name="Use MCprep MeshSwap",
         description="Automatically swap vegetation, torches, and 3D blocks with MCprep models if MCprep addon is active",
         default=True,
+    )
+
+    use_block_manifest: BoolProperty(
+        name="Place MCprep Assets from Manifest",
+        description=(
+            "Read the exporter's blocks.json and instance a real MCprep 3D "
+            "asset at every recorded block position, replacing that block "
+            "type's flat/cube geometry from the OBJ"
+        ),
+        default=True,
+    )
+
+    grass_tufts: BoolProperty(
+        name="Grass Tufts on Grass Blocks",
+        description=(
+            "Scatter MCprep's 3D grass tuft on top of every grass block. "
+            "MCprep has no grass_block model of its own, so the block keeps "
+            "its exported geometry and the tuft is added above it. Off by "
+            "default: vanilla only grows grass on some blocks, so covering "
+            "all of them looks considerably denser than the game"
+        ),
+        default=False,
     )
 
     organise_collections: BoolProperty(
@@ -168,6 +730,67 @@ class IMPORT_OT_project_bedrock(Operator, ImportHelper):
                         self.report({'WARNING'}, f"MCprep meshswap warning: {e}")
                 t_mcprep_meshswap = (time.time() - t0) * 1000.0
 
+        # 4. Water colour/transmission override, applied AFTER MCprep so it
+        # survives — MCprep's own prep_materials rebuilds each material's
+        # node graph from scratch, discarding anything wired in step 1.
+        # (Biome tint itself is baked into the exported atlas per-swatch by
+        # the Rust exporter, so it doesn't need a post-MCprep pass here.)
+        t0 = time.time()
+        self.apply_water_appearance(context)
+        t_tint = (time.time() - t0) * 1000.0
+
+        # 5. Place real MCprep 3D assets from the exporter's manifest. Runs
+        # last so it can delete the OBJ geometry for any block type it takes
+        # over, without earlier passes tripping over the missing objects.
+        t0 = time.time()
+        t_instancing = 0.0
+        instanced = {}
+        if self.use_block_manifest:
+            # Only the manifest belonging to *this* OBJ. A shared
+            # "blocks.json" in the output folder gets silently paired with
+            # whichever export ran last, and a manifest from a different
+            # region places every asset at coordinates from another part of
+            # the world — plants and chests scattered through open air.
+            manifest_path = os.path.splitext(self.filepath)[0] + ".blocks.json"
+            if not os.path.isfile(manifest_path):
+                legacy = os.path.join(os.path.dirname(self.filepath), "blocks.json")
+                if os.path.isfile(legacy):
+                    self.report(
+                        {'WARNING'},
+                        "Ignoring blocks.json: it is not named for this export and may "
+                        "describe a different region. Re-export to place 3D assets.",
+                    )
+            if os.path.isfile(manifest_path):
+                try:
+                    instanced, skipped = instance_blocks_from_manifest(
+                        context, manifest_path, self.report, self.grass_tufts
+                    )
+                    if skipped:
+                        print(
+                            "  No MCprep asset for: " + ", ".join(sorted(skipped))
+                        )
+                except Exception as e:
+                    self.report({'WARNING'}, f"Block instancing failed: {e}")
+            t_instancing = (time.time() - t0) * 1000.0
+
+        # 6. Give the prototype meshes the same MCprep material treatment the
+        # terrain got. Prototypes are loaded in step 5, after prep_materials
+        # has already run, so without this pass the block types that use a
+        # prototype -- usually most of them -- keep the plain material the OBJ
+        # importer built and look untreated next to the MCprep-shaded terrain.
+        t0 = time.time()
+        if self.use_mcprep_materials:
+            self.prep_prototype_materials(context)
+        # Nearest-neighbour sampling, applied last and to everything. Setting
+        # it earlier does not survive: prep_materials rebuilds each material's
+        # node graph from scratch, discarding the interpolation set in step 1.
+        # Minecraft art is 16x16 pixel texels; any smoothing turns them to mush.
+        pixelated = set_pixelated_filtering()
+        # Runs last so it also catches helpers spawned by MCprep's meshswap,
+        # not just those pulled in as append dependencies.
+        helpers_hidden = hide_meshswap_helpers()
+        t_filtering = (time.time() - t0) * 1000.0
+
         wm.progress_update(100)
         wm.progress_end()
 
@@ -181,6 +804,11 @@ class IMPORT_OT_project_bedrock(Operator, ImportHelper):
             f"  - Collection Organisation:  {t_collections:.1f} ms\n"
             f"  - MCprep Materials:         {t_mcprep_materials:.1f} ms\n"
             f"  - MCprep MeshSwap:          {t_mcprep_meshswap:.1f} ms\n"
+            f"  - Water Appearance:         {t_tint:.1f} ms\n"
+            f"  - MCprep Asset Placement:   {t_instancing:.1f} ms"
+            f" ({sum(instanced.values())} instances across {len(instanced)} block types)\n"
+            f"  - Cleanup:                  {t_filtering:.1f} ms"
+            f" ({pixelated} texture node(s) set to Closest)\n"
             f"  - Objects Processed:        {len(imported_objs)}\n"
             f"=======================================================\n"
         )
@@ -353,6 +981,45 @@ class IMPORT_OT_project_bedrock(Operator, ImportHelper):
         for mat in bpy.data.materials:
             self._apply_pbr_to_material(mat, atlas_path)
 
+    # Alpha cutout is no longer set up here. The exporter's MTL now declares
+    # it per material the way Mineways' does (`illum 4` + `map_d`), which
+    # Blender's OBJ importer wires natively and *per pixel*. Probing the atlas
+    # from Python could only judge a whole material at once, so a block that
+    # samples several tiles — a grass block uses top, side, dirt and the side
+    # overlay — was called transparent because of the one tile that is, and
+    # solid ground ended up with holes through it.
+
+    def apply_water_appearance(self, context):
+        """Override the water material's colour/transmission.
+
+        Runs after MCprep for the same reason as apply_biome_tint: MCprep's
+        prep_materials rebuilds this material from scratch and would
+        otherwise discard an override wired in any earlier step.
+        """
+        mat = bpy.data.materials.get("water")
+        if not mat or not mat.use_nodes or not mat.node_tree:
+            return
+        principled = mat.node_tree.nodes.get('Principled BSDF')
+        if not principled:
+            for n in mat.node_tree.nodes:
+                if n.type == 'BSDF_PRINCIPLED':
+                    principled = n
+                    break
+        if not principled:
+            return
+
+        base_color_input = principled.inputs['Base Color']
+        for link in list(base_color_input.links):
+            mat.node_tree.links.remove(link)  # a linked socket ignores default_value
+        base_color_input.default_value = (0.08, 0.35, 0.75, 1.0)
+        if 'Roughness' in principled.inputs:
+            principled.inputs['Roughness'].default_value = 0.05
+        if 'Transmission Weight' in principled.inputs:
+            principled.inputs['Transmission Weight'].default_value = 0.85
+        if 'IOR' in principled.inputs:
+            principled.inputs['IOR'].default_value = 1.333
+        self._set_alpha_render_mode(mat, 'BLENDED')
+
     def _find_atlas(self):
         obj_dir = os.path.dirname(self.filepath)
         obj_base = os.path.splitext(os.path.basename(self.filepath))[0]
@@ -367,6 +1034,26 @@ class IMPORT_OT_project_bedrock(Operator, ImportHelper):
             if os.path.isfile(path):
                 return path
         return None
+
+    def _set_alpha_render_mode(self, mat, mode):
+        """Set alpha rendering mode across Blender versions.
+
+        Blender 4.2+ controls this via `surface_render_method` ('DITHERED'
+        for cutout foliage, 'BLENDED' for glass/water/translucent). On 5.x,
+        `blend_method` still exists as a property but no longer affects
+        rendering, so it must not be relied on as the primary path.
+        """
+        if hasattr(mat, 'surface_render_method'):
+            try:
+                mat.surface_render_method = mode
+                return
+            except Exception:
+                pass
+        if hasattr(mat, 'blend_method'):
+            try:
+                mat.blend_method = 'CLIP' if mode == 'DITHERED' else 'BLEND'
+            except Exception:
+                pass
 
     def _apply_pbr_to_material(self, mat, atlas_path):
         if not mat.use_nodes:
@@ -391,49 +1078,14 @@ class IMPORT_OT_project_bedrock(Operator, ImportHelper):
             output.location = (300, 0)
             links.new(principled.outputs['BSDF'], output.inputs['Surface'])
 
-        # MCprep default texture pack path & individual exported textures folder
-        mcprep_tp = Path(r"C:\Users\zebby\AppData\Roaming\Blender Foundation\Blender\5.2\scripts\addons\MCprep_addon\MCprep_resources\resourcepacks\mcprep_default\assets\minecraft\textures")
-        
-        exported_textures_dir = None
-        if hasattr(self, 'filepath') and self.filepath:
-            exported_textures_dir = Path(self.filepath).parent / "textures"
-
-        # Foliage materials requiring vibrant biome green tinting
-        FOLIAGE_MATS = {
-            "grass_block", "short_grass", "tall_grass", "fern", "oak_leaves",
-            "jungle_leaves", "acacia_leaves", "dark_oak_leaves", "mangrove_leaves",
-            "birch_leaves", "spruce_leaves", "vine", "lily_pad", "sugar_cane",
-            "leaf_litter", "moss_block", "moss_carpet", "firefly_bush"
-        }
-
-        # Materials needing alpha cutout transparency
-        ALPHA_MATS = {
-            "oak_leaves", "jungle_leaves", "acacia_leaves", "dark_oak_leaves",
-            "mangrove_leaves", "birch_leaves", "spruce_leaves", "short_grass",
-            "tall_grass", "fern", "vine", "lily_pad", "sugar_cane", "spawner",
-            "glass", "tinted_glass", "seagrass", "tall_seagrass", "dandelion",
-            "poppy", "blue_orchid", "allium", "azure_bluet", "cornflower",
-            "oxeye_daisy", "peony", "pointed_dripstone", "glow_lichen"
-        }
-
-        # Try to locate individual 16x16 PNG texture for this block material
-        individual_img = None
-        candidates = []
-        if exported_textures_dir and exported_textures_dir.exists():
-            candidates.append(exported_textures_dir / f"{clean_name}.png")
-        candidates.extend([
-            mcprep_tp / "block" / f"{clean_name}.png",
-            mcprep_tp / "item" / f"{clean_name}.png",
-            mcprep_tp / "entity/chest" / f"{clean_name}.png",
-        ])
-
-        for cand in candidates:
-            if cand.exists():
-                try:
-                    individual_img = bpy.data.images.load(str(cand), check_existing=True)
-                    break
-                except Exception:
-                    pass
+        # NOTE: we intentionally do NOT swap in a standalone per-block PNG
+        # here (e.g. a "textures/<name>.png" next to the export), even if
+        # one exists. The mesh's UVs are baked relative to the shared atlas
+        # (a small sub-rectangle per face, e.g. u=[0.3125, 0.375] for one
+        # atlas column) — pointing the same UVs at a standalone 16x16 image
+        # instead samples a razor-thin sliver of it, stretched across the
+        # whole face, which renders as a flat/wrong solid colour. The atlas
+        # is the only texture whose UV space actually matches this mesh.
 
         # Find existing TEX_IMAGE node or reuse/create one
         tex_image = None
@@ -448,9 +1100,7 @@ class IMPORT_OT_project_bedrock(Operator, ImportHelper):
         tex_image.name = "MCPREP_diffuse"
         tex_image.interpolation = 'Closest'
 
-        if individual_img:
-            tex_image.image = individual_img
-        elif atlas_path and os.path.isfile(atlas_path) and not tex_image.image:
+        if atlas_path and os.path.isfile(atlas_path) and not tex_image.image:
             tex_image.image = bpy.data.images.load(atlas_path, check_existing=True)
 
         if hasattr(tex_image, 'mnp'):
@@ -465,47 +1115,19 @@ class IMPORT_OT_project_bedrock(Operator, ImportHelper):
                 pass
 
         if principled:
-            if clean_name in FOLIAGE_MATS:
-                old_mix = nodes.get('FoliageBiomeTint')
-                if old_mix:
-                    nodes.remove(old_mix)
-                
-                mix_node = nodes.new('ShaderNodeMix')
-                mix_node.name = 'FoliageBiomeTint'
-                mix_node.data_type = 'RGBA'
-                mix_node.blend_type = 'MULTIPLY'
-                # Set Factor socket = 1.0 (full multiply)
-                mix_node.inputs[0].default_value = 1.0
-                # Set Tint Color socket (Input 7) = Lush Biome Green
-                mix_node.inputs[7].default_value = (0.28, 0.72, 0.18, 1.0)
-                mix_node.location = (-250, 0)
-                
-                links.new(tex_image.outputs['Color'], mix_node.inputs[6])
-                links.new(mix_node.outputs[2], principled.inputs['Base Color'])
-            else:
-                links.new(tex_image.outputs['Color'], principled.inputs['Base Color'])
+            # Base colour only — biome tinting is applied in a later pass
+            # (apply_biome_tint), after MCprep's own material rebuild, since
+            # anything wired here gets discarded by bpy.ops.mcprep.prep_materials.
+            links.new(tex_image.outputs['Color'], principled.inputs['Base Color'])
 
             if clean_name in ALPHA_MATS or 'leaf' in clean_name or 'grass' in clean_name or 'flower' in clean_name:
                 links.new(tex_image.outputs['Alpha'], principled.inputs['Alpha'])
-                if hasattr(mat, 'blend_method'):
-                    try:
-                        mat.blend_method = 'CLIP'
-                    except Exception:
-                        pass
+                self._set_alpha_render_mode(mat, 'DITHERED')
 
-        if clean_name == "water" and principled:
-            principled.inputs['Base Color'].default_value = (0.08, 0.35, 0.75, 1.0)
-            if 'Roughness' in principled.inputs:
-                principled.inputs['Roughness'].default_value = 0.05
-            if 'Transmission Weight' in principled.inputs:
-                principled.inputs['Transmission Weight'].default_value = 0.85
-            if 'IOR' in principled.inputs:
-                principled.inputs['IOR'].default_value = 1.333
-            if hasattr(mat, 'blend_method'):
-                try:
-                    mat.blend_method = 'BLEND'
-                except Exception:
-                    pass
+        # Water's colour/transmission override lives in apply_water_appearance,
+        # applied after MCprep for the same reason as biome tint (see
+        # apply_biome_tint) — MCprep's prep_materials rebuilds this material
+        # from scratch and would otherwise discard it.
 
     def invoke(self, context, event):
         context.window_manager.fileselect_add(self)

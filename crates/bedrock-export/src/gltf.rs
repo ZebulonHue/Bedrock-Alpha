@@ -107,7 +107,14 @@ pub fn export_gltf(
     let mut blocks = 0usize;
     let mut total_faces = 0usize;
 
+    // Borrowed-key fast path into `mat_to_prim`, avoiding a per-block
+    // allocation (keys borrow from `chunks`, which outlives this loop).
+    let mut prim_of_name: HashMap<&str, usize> = HashMap::new();
+
     for chunk in chunks {
+        if !region.overlaps_chunk(chunk.x, chunk.z) {
+            continue;
+        }
         let Some((chunk_min_y, chunk_max_y)) = chunk.y_range() else {
             continue;
         };
@@ -129,20 +136,41 @@ pub fn export_gltf(
                         continue;
                     }
                     blocks += 1;
-                    let material = sanitise(strip_namespace(name));
-                    let prim_idx = mat_to_prim.len();
-                    let prim_idx = *mat_to_prim.entry(material.clone()).or_insert(prim_idx);
-                    if prim_idx == primitives.len() {
-                        primitives.push(MeshPrimitive {
-                            material_name: material.clone(),
-                            vertices: Vec::new(),
-                            indices: Vec::new(),
-                        });
-                    }
+                    // Sanitising the name allocates, so do it once per distinct
+                    // block type rather than once per block; grouping still
+                    // keys off the sanitised name, as before.
+                    let clean_name = strip_namespace(name);
+                    let prim_idx = match prim_of_name.get(clean_name) {
+                        Some(&idx) => idx,
+                        None => {
+                            let material = sanitise(clean_name);
+                            let idx = if let Some(&existing) = mat_to_prim.get(&material) {
+                                existing
+                            } else {
+                                let new_idx = primitives.len();
+                                primitives.push(MeshPrimitive {
+                                    material_name: material.clone(),
+                                    vertices: Vec::new(),
+                                    indices: Vec::new(),
+                                });
+                                mat_to_prim.insert(material, new_idx);
+                                new_idx
+                            };
+                            prim_of_name.insert(clean_name, idx);
+                            idx
+                        }
+                    };
                     let prim = &mut primitives[prim_idx];
 
                     let tex_key = state.texture_key();
-                    let quads = block_shape::block_quads(wx, y, wz, state.name.as_str(), &block_at);
+                    let quads = block_shape::block_quads_stated(
+                        wx,
+                        y,
+                        wz,
+                        state.name.as_str(),
+                        &state.properties,
+                        &block_at,
+                    );
 
                     for quad in &quads {
                         let [u0, v0, u1, v1] = if let Some(tex) = &quad.texture {
@@ -198,6 +226,16 @@ pub fn export_gltf(
     }
 
     if blocks == 0 {
+        return Err(ExportError::EmptyRegion);
+    }
+
+    // A primitive is created as soon as a block of that type is seen, but a
+    // fully-enclosed block contributes no visible quads, so a type that only
+    // ever occurs buried leaves an empty primitive. Zero-length accessors are
+    // invalid glTF, so drop them (same defect as the OBJ writer's empty
+    // groups).
+    primitives.retain(|prim| !prim.indices.is_empty());
+    if primitives.is_empty() {
         return Err(ExportError::EmptyRegion);
     }
 

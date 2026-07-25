@@ -9,13 +9,12 @@ use bedrock_parser::bedrock::BedrockWorld;
 use bedrock_parser::blocks::{block_color, is_air};
 use bedrock_parser::chunk::Chunk;
 use bedrock_parser::detect::{Edition, WorldSummary};
-use bedrock_parser::jar_textures::JarTextureLoader;
-use bedrock_parser::java_simple::ExteriorWorld;
+use bedrock_parser::mineways::build_mineways_tileset;
 use bedrock_parser::region::RegionFile;
 use bedrock_parser::texture::FaceAwareTileSet;
 use bedrock_parser::world::World;
 use bedrock_render::math::Camera;
-use bedrock_render::mesh::{chunks_to_meshes, mesh_exterior_world, AtlasPixels, ChunkMesh};
+use bedrock_render::mesh::{chunks_to_meshes, AtlasPixels, ChunkMesh};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -75,7 +74,7 @@ pub fn load_active_world(
     radius_chunks: i32,
 ) -> Result<(ActiveWorld, Vec<ChunkMesh>), String> {
     match summary.edition {
-        Edition::Java => load_java_simple(summary),
+        Edition::Java => load_java_active(summary, radius_chunks),
         Edition::Bedrock => load_bedrock_active(summary, radius_chunks),
     }
 }
@@ -106,6 +105,19 @@ fn load_bedrock_active(
     )
 }
 
+/// Chunk coordinates at the middle of the largest region file.
+///
+/// Region size tracks how much of that area has been generated and modified,
+/// so the biggest file is a good stand-in for "where the player actually
+/// played" when the save records no player position.
+fn busiest_region_centre(world: &World) -> Option<(i32, i32)> {
+    world
+        .regions()
+        .into_iter()
+        .max_by_key(|(_, _, path)| std::fs::metadata(path).map(|m| m.len()).unwrap_or(0))
+        .map(|(rx, rz, _)| (rx * 32 + 16, rz * 32 + 16))
+}
+
 /// Extract which dimension a region file belongs to from its path.
 #[allow(dead_code)]
 fn dim_from_path(path: &Path) -> i32 {
@@ -121,7 +133,6 @@ fn dim_from_path(path: &Path) -> i32 {
     0
 }
 
-#[allow(dead_code)]
 fn load_java_active(
     summary: &WorldSummary,
     radius_chunks: i32,
@@ -136,9 +147,19 @@ fn load_java_active(
             };
             (cx, cz, meta.player_pos)
         }
-        Err(_) => {
-            tracing::info!("No level.dat — using chunk (0,0) as loading center");
-            (0, 0, None)
+        Err(_) => (0, 0, None),
+    };
+    // A save without a player position (or one still at spawn) would otherwise
+    // load chunk (0,0) — usually untouched wilderness, hundreds of blocks from
+    // anything the player built. The region files show where the world really
+    // is: a region only grows as its chunks are generated and modified, so the
+    // largest one is the part that has actually been played.
+    let (center_x, center_z) = if player_pos.is_some() {
+        (center_x, center_z)
+    } else {
+        match busiest_region_centre(&world) {
+            Some(centre) => centre,
+            None => (center_x, center_z),
         }
     };
     tracing::info!(
@@ -206,98 +227,20 @@ fn load_java_active(
 
 /// Load a Java world using chunkforge-core's simple approach.
 /// All blocks render as cubes with opacity-based face culling.
-pub fn load_java_simple(summary: &WorldSummary) -> Result<(ActiveWorld, Vec<ChunkMesh>), String> {
-    let paths: Vec<std::path::PathBuf> = find_mca_files(&summary.folder);
-    if paths.is_empty() {
-        return Err(format!(
-            "No .mca files found in '{}'",
-            summary.folder.display()
-        ));
-    }
-
-    let world = ExteriorWorld::load(&paths)?;
-    if world.is_empty() {
-        return Err("No exterior blocks found — world is empty".into());
-    }
-
-    // Build procedural tile set (no JAR loading).
-    let block_names: Vec<String> = world.names.clone();
-    let tiles = FaceAwareTileSet::build(block_names, &JarTextureLoader::empty());
-
-    let chunk_meshes = mesh_exterior_world(&world, &tiles);
-
-    let atlas = AtlasPixels {
-        rgba: tiles.atlas.pixels.clone(),
-        width: tiles.atlas.width,
-        height: tiles.atlas.height,
-    };
-
-    let total_verts: usize = chunk_meshes.iter().map(|m| m.vertices.len()).sum();
-    let total_tris: usize = chunk_meshes.iter().map(|m| m.triangle_count()).sum();
-    tracing::info!(
-        "Meshed {} blocks: {} vertices, {} triangles",
-        world.len(),
-        total_verts,
-        total_tris,
-    );
-
-    // Center camera on the world bounds.
-    let world_center = world_center(&world);
-    let camera = Camera {
-        target: [world_center[0], world_center[1], world_center[2]],
-        ..Camera::default()
-    };
-
-    let active = ActiveWorld {
-        name: summary.name.clone(),
-        handle: WorldHandle::Java(World::open(summary.folder.clone())),
-        chunk_map: HashMap::new(),
-        loaded_chunks: HashSet::new(),
-        tiles,
-        atlas,
-        player_pos: None,
-        overview: None,
-        camera,
-    };
-
-    Ok((active, chunk_meshes))
-}
-
-/// Recursively find all `.mca` files under a folder.
-fn find_mca_files(folder: &Path) -> Vec<std::path::PathBuf> {
-    let mut results = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(folder) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                results.extend(find_mca_files(&path));
-            } else if path.extension().is_some_and(|x| x == "mca") {
-                results.push(path);
-            }
-        }
-    }
-    results
-}
-
+/// Block-data region files for a world, nearest the origin first.
+///
+/// A save keeps three parallel sets of `.mca` files: `region/` holds blocks,
+/// while `entities/` and `poi/` hold entity and point-of-interest records in
+/// the same container format but with completely different NBT inside. A
+/// recursive "any `.mca`" scan picks up all three, and the chunk parser —
+/// finding no `sections` in an entities chunk — concludes the save is
+/// pre-1.18 and fails the *entire* load with a misleading format error. On a
+/// real save that is 41 non-block files against 26 real ones.
+///
+/// [`World::regions`] already knows where block data lives, including the
+/// legacy `DIM<n>` and modern `dimensions/<ns>/<name>` layouts, so use it
+/// rather than walking the tree blindly.
 /// Compute the center of an ExteriorWorld (average of bounds).
-fn world_center(world: &ExteriorWorld) -> [f32; 3] {
-    let mut min = [i32::MAX; 3];
-    let mut max = [i32::MIN; 3];
-    for &(x, y, z) in world.blocks.keys() {
-        min[0] = min[0].min(x);
-        max[0] = max[0].max(x);
-        min[1] = min[1].min(y);
-        max[1] = max[1].max(y);
-        min[2] = min[2].min(z);
-        max[2] = max[2].max(z);
-    }
-    [
-        (min[0] + max[0]) as f32 / 2.0,
-        (min[1] + max[1]) as f32 / 2.0,
-        (min[2] + max[2]) as f32 / 2.0,
-    ]
-}
-
 /// Shared tail: build tileset, mesh, overview, camera, wrap in ActiveWorld.
 fn finish_active_loading(
     name: &str,
@@ -318,22 +261,9 @@ fn finish_active_loading(
         .flat_map(|c| c.block_names().into_iter().map(str::to_owned))
         .collect();
 
-    let tiles = match JarTextureLoader::load() {
-        Ok(loader) => {
-            tracing::info!(
-                "Using real textures from Minecraft {} ({} textures)",
-                loader.version,
-                loader.len()
-            );
-            FaceAwareTileSet::build(block_names, &loader)
-        }
-        Err(reason) => {
-            tracing::warn!(
-                "No Minecraft textures available — using procedural tiles. Reason: {reason}"
-            );
-            FaceAwareTileSet::build(block_names, &JarTextureLoader::empty())
-        }
-    };
+    // Same atlas as the exporter, so the viewport and the exported model
+    // always agree about what a block looks like.
+    let tiles = build_mineways_tileset(&block_names);
 
     let chunk_meshes = chunks_to_meshes(&chunks, &tiles);
     let atlas = AtlasPixels {
@@ -473,4 +403,40 @@ fn build_overview(chunks: &[Chunk]) -> Option<OverviewImage> {
         origin_x: min_cx * 16,
         origin_z: min_cz * 16,
     })
+}
+
+/// Load every chunk overlapping `region` directly from the world files.
+///
+/// The streaming loader only keeps chunks near the camera in `chunk_map`, and
+/// the Java path (`load_java_simple`) never populates it at all — it meshes a
+/// flat block list instead. Exporting straight from that map therefore hands
+/// the exporter nothing and fails with "the selected region contains no
+/// blocks", regardless of what the user selected. Reading the region's chunks
+/// on demand keeps the export independent of whatever happens to be resident.
+pub fn load_chunks_for_region(
+    handle: &WorldHandle,
+    min_x: i32,
+    min_z: i32,
+    max_x: i32,
+    max_z: i32,
+) -> Vec<Chunk> {
+    let (cx0, cx1) = (min_x.div_euclid(16), (max_x - 1).div_euclid(16));
+    let (cz0, cz1) = (min_z.div_euclid(16), (max_z - 1).div_euclid(16));
+    let mut chunks = Vec::new();
+    for cz in cz0..=cz1 {
+        for cx in cx0..=cx1 {
+            if let Some(chunk) = load_one_chunk(handle, cx, cz) {
+                chunks.push(chunk);
+            }
+        }
+    }
+    tracing::info!(
+        "Loaded {} chunk(s) covering the export region ({}..{}, {}..{})",
+        chunks.len(),
+        min_x,
+        max_x,
+        min_z,
+        max_z
+    );
+    chunks
 }
