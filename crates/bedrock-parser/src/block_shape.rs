@@ -271,17 +271,25 @@ fn model_quads<'a>(
                 f64::from(normal[1]),
                 f64::from(normal[2]),
             ];
+            // Negated: vanilla's blockstate `x`/`y` rotation turns the model
+            // *clockwise* seen from the positive axis, the opposite sense to
+            // `rotate_about`. Getting this backwards is close to invisible —
+            // 0 and 180 degrees are symmetric, so north and south still land
+            // right — while every 90-degree case silently mirrors: east/west
+            // and up/down swap. That put mushroom caps on the opposite face
+            // from the one the save named, and turned stairs, doors, buttons
+            // and amethyst buds the wrong way round.
             if x_rot != 0.0 {
                 for corner in &mut corners {
-                    *corner = rotate_about(*corner, 0, f64::from(x_rot), block_centre, false);
+                    *corner = rotate_about(*corner, 0, -f64::from(x_rot), block_centre, false);
                 }
-                normal_dir = rotate_about(normal_dir, 0, f64::from(x_rot), [0.0; 3], false);
+                normal_dir = rotate_about(normal_dir, 0, -f64::from(x_rot), [0.0; 3], false);
             }
             if y_rot != 0.0 {
                 for corner in &mut corners {
-                    *corner = rotate_about(*corner, 1, f64::from(y_rot), block_centre, false);
+                    *corner = rotate_about(*corner, 1, -f64::from(y_rot), block_centre, false);
                 }
-                normal_dir = rotate_about(normal_dir, 1, f64::from(y_rot), [0.0; 3], false);
+                normal_dir = rotate_about(normal_dir, 1, -f64::from(y_rot), [0.0; 3], false);
             }
             for corner in &mut corners {
                 *corner = add3(*corner, offset);
@@ -569,5 +577,47 @@ mod fence_state_tests {
         assert!(!north.0.is_empty(), "stairs must emit geometry");
         assert_ne!(north.1, east.1, "facings need different meshes");
         assert_ne!(north.0, east.0, "a north stair is not an east stair");
+    }
+}
+
+#[cfg(test)]
+mod blockstate_rotation_tests {
+    use super::*;
+
+    /// Blockstate `x`/`y` rotation is *clockwise* viewed from the positive
+    /// axis, the opposite sense to a textbook counter-clockwise rotation.
+    ///
+    /// A mushroom block is the clearest witness: vanilla models it as one flat
+    /// face turned into place by the blockstate, one variant per side. With
+    /// the rotation inverted, north and south still land correctly — 0 and 180
+    /// degrees are symmetric — while east/west and up/down silently swap, so
+    /// the cap texture appears on the face opposite the one the save asked
+    /// for. The same error turns every stair, door, button and bud the wrong
+    /// way round.
+    #[test]
+    fn single_face_lands_on_the_side_the_state_names() {
+        let nothing = |_: i32, _: i32, _: i32| -> Option<&str> { None };
+        let face_normal = |side: &str| {
+            let props: HashMap<String, String> = ["north", "south", "east", "west", "up", "down"]
+                .iter()
+                .map(|k| ((*k).to_owned(), if *k == side { "true" } else { "false" }.to_owned()))
+                .collect();
+            let quads =
+                block_quads_stated(0, 0, 0, "minecraft:red_mushroom_block", &props, &nothing);
+            let capped: Vec<_> = quads
+                .iter()
+                .filter(|q| q.texture.as_deref() == Some("red_mushroom_block"))
+                .collect();
+            assert_eq!(capped.len(), 1, "{side}: exactly one face wears the cap");
+            capped[0].normal
+        };
+
+        // Minecraft axes: +Y up, +Z south, +X east.
+        assert_eq!(face_normal("up"), [0, 1, 0], "up must face up");
+        assert_eq!(face_normal("down"), [0, -1, 0], "down must face down");
+        assert_eq!(face_normal("north"), [0, 0, -1], "north must face north");
+        assert_eq!(face_normal("south"), [0, 0, 1], "south must face south");
+        assert_eq!(face_normal("east"), [1, 0, 0], "east must face east");
+        assert_eq!(face_normal("west"), [-1, 0, 0], "west must face west");
     }
 }
