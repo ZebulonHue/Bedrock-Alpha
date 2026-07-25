@@ -730,7 +730,7 @@ class IMPORT_OT_project_bedrock(Operator, ImportHelper):
     filename_ext = ".obj"
 
     filter_glob: StringProperty(
-        default="*.obj",
+        default="*.obj;*.glb;*.gltf",
         options={'HIDDEN'},
     )
 
@@ -1004,8 +1004,17 @@ class IMPORT_OT_project_bedrock(Operator, ImportHelper):
         return {'FINISHED'}
 
     def import_obj(self, context):
-        """Import the OBJ using Blender's built-in importer with version fallback."""
+        """Import the mesh using Blender's built-in importer for its format.
+
+        Everything the add-on does after this point -- MCprep materials, the
+        manifest-driven prototype instancing, nearest-neighbour filtering, the
+        leaf and water shading -- works off objects and materials, not off the
+        file, so it applies to any format Blender can read.
+        """
         res = {'CANCELLED'}
+        if self.filepath.lower().endswith(('.glb', '.gltf')):
+            return self.import_gltf(context)
+
         # Modern C++ importer (Blender 4.0+, 5.x)
         if hasattr(bpy.ops.wm, 'obj_import'):
             try:
@@ -1042,6 +1051,32 @@ class IMPORT_OT_project_bedrock(Operator, ImportHelper):
                 clean_name = obj.active_material.name.split('.')[0]
                 obj.name = clean_name
 
+        return res
+
+    def import_gltf(self, context):
+        """Import a .glb/.gltf.
+
+        No axis arguments here on purpose: glTF declares Y-up in its own
+        specification and Blender's importer converts to Z-up itself, unlike
+        the OBJ importer which has to be told. Passing a conversion as well
+        would rotate the scene twice.
+
+        Objects are renamed after their material for the same reason as the
+        OBJ path -- MCprep matches block types by name, and a glTF names its
+        nodes however the tool that wrote it chose to.
+        """
+        if not hasattr(bpy.ops.import_scene, 'gltf'):
+            self.report({'ERROR'}, "The glTF importer is not enabled in this Blender")
+            return {'CANCELLED'}
+        try:
+            res = bpy.ops.import_scene.gltf(filepath=self.filepath)
+        except Exception as e:
+            self.report({'ERROR'}, f"import_scene.gltf failed: {e}")
+            return {'CANCELLED'}
+
+        for obj in context.selected_objects:
+            if obj.type == 'MESH' and obj.active_material:
+                obj.name = obj.active_material.name.split('.')[0]
         return res
 
     def organise_objects(self, context):
