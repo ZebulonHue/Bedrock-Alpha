@@ -41,9 +41,14 @@ pub struct PrototypeStats {
 /// evaluated at the origin with nothing adjacent, so every face is present —
 /// an instanced prototype is placed wherever the block occurs and cannot know
 /// in advance which of its faces will be hidden.
+/// Write one prototype per distinct *block state*, not per block type.
+///
+/// `blocks` maps a prototype file stem to the state it should be built from;
+/// build it with [`bedrock_parser::block_shape::prototype_stem`] so the names
+/// match what the importer looks for.
 pub fn write_block_prototypes(
     obj_path: &Path,
-    blocks: &BTreeMap<String, BTreeMap<String, String>>,
+    blocks: &BTreeMap<String, (String, BTreeMap<String, String>)>,
 ) -> PrototypeStats {
     let mut stats = PrototypeStats::default();
 
@@ -67,7 +72,7 @@ pub fn write_block_prototypes(
 
     let mut extracted: BTreeSet<String> = BTreeSet::new();
 
-    for (block, properties) in blocks {
+    for (stem, (block, properties)) in blocks {
         // No neighbours: every face of the prototype must be drawn.
         let nothing_adjacent = |_: i32, _: i32, _: i32| -> Option<&str> { None };
         let props: std::collections::HashMap<String, String> = properties
@@ -83,7 +88,7 @@ pub fn write_block_prototypes(
             &nothing_adjacent,
         );
         if quads.is_empty() {
-            stats.skipped.push(block.clone());
+            stats.skipped.push(stem.clone());
             continue;
         }
 
@@ -103,15 +108,15 @@ pub fn write_block_prototypes(
             by_texture.entry(texture).or_default().push(quad);
         }
 
-        let obj_file = dir.join(format!("{block}.obj"));
-        let mtl_file = dir.join(format!("{block}.mtl"));
+        let obj_file = dir.join(format!("{stem}.obj"));
+        let mtl_file = dir.join(format!("{stem}.mtl"));
         let Ok(obj) = std::fs::File::create(&obj_file) else {
-            stats.skipped.push(block.clone());
+            stats.skipped.push(stem.clone());
             continue;
         };
         let mut obj = BufWriter::new(obj);
-        let _ = writeln!(obj, "# Project Bedrock prototype: {block}");
-        let _ = writeln!(obj, "mtllib {block}.mtl");
+        let _ = writeln!(obj, "# Project Bedrock prototype: {stem}");
+        let _ = writeln!(obj, "mtllib {stem}.mtl");
 
         // Centre the prototype on its own origin so an instance lands at the
         // block's centre rather than its corner.
@@ -123,7 +128,7 @@ pub fn write_block_prototypes(
             let cutout = extract_texture(&loader, texture, &texture_dir, &mut extracted);
             materials.push((texture.clone(), cutout));
 
-            let _ = writeln!(obj, "o {block}_{texture}");
+            let _ = writeln!(obj, "o {stem}_{texture}");
             let _ = writeln!(obj, "usemtl {texture}");
             for quad in group {
                 for corner in &quad.corners {
@@ -161,7 +166,7 @@ pub fn write_block_prototypes(
 
         if !wrote_any {
             let _ = std::fs::remove_file(&obj_file);
-            stats.skipped.push(block.clone());
+            stats.skipped.push(stem.clone());
             continue;
         }
 

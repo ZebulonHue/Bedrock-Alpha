@@ -39,15 +39,22 @@ fn main() {
         }
     };
 
-    // Same rule the exporter uses: one prototype per block type, built from
-    // whichever block state occurs most often, since a single mesh is reused
-    // at every position.
-    let mut representative: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    // Same rule the exporter uses: one prototype per distinct block *state*,
+    // keyed by the stem the importer will look for. A fence joined north-south
+    // and one joined east-west are different meshes.
+    let mut representative: BTreeMap<String, (String, BTreeMap<String, String>)> = BTreeMap::new();
     for (name, variants) in &manifest.blocks {
-        let Some(commonest) = variants.iter().max_by_key(|v| v.positions.len()) else {
-            continue;
-        };
-        representative.insert(name.clone(), commonest.properties.clone());
+        for variant in variants {
+            let as_map: std::collections::HashMap<String, String> = variant
+                .properties
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            let stem = bedrock_parser::block_shape::prototype_stem(name, &as_map);
+            representative
+                .entry(stem)
+                .or_insert_with(|| (name.clone(), variant.properties.clone()));
+        }
     }
 
     // `write_block_prototypes` derives `prototypes/` from the OBJ's directory,

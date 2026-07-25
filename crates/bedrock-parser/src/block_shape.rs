@@ -12,6 +12,60 @@ use crate::chunk::strip_namespace;
 use crate::java_simple::appearance;
 use std::collections::HashMap;
 
+/// A filesystem- and identifier-safe key for the block state of one mesh.
+///
+/// Consumers that build a mesh per block *type* get fences and stairs wrong:
+/// a fence's shape depends on which neighbours it connects to and a stair's on
+/// `facing`/`half`/`shape`, so a single mesh reused at every position renders
+/// one arbitrary form of the block everywhere. Keying meshes by state fixes
+/// that, and this is the shared naming both the exporter and the importer use
+/// so their files line up.
+///
+/// Only states the block's model actually reads are included, so variants
+/// differing solely by something cosmetic like `waterlogged` collapse onto one
+/// mesh rather than duplicating it. Blocks whose geometry is stateless return
+/// `None`, keeping their prototype named after the block alone.
+pub fn geometry_state_key(
+    block_name: &str,
+    properties: &HashMap<String, String>,
+) -> Option<String> {
+    let short = strip_namespace(block_name);
+    let model = model_for(short)?;
+
+    // Sorted so the same state always produces the same key, whatever order
+    // the properties arrived in.
+    let mut relevant: Vec<(&str, &str)> = model
+        .variants
+        .iter()
+        .flat_map(|variant| variant.when.iter())
+        .map(|cond| cond.key)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .filter_map(|key| properties.get(key).map(|value| (key, value.as_str())))
+        .collect();
+    relevant.sort_unstable();
+
+    if relevant.is_empty() {
+        return None;
+    }
+    Some(
+        relevant
+            .iter()
+            .map(|(key, value)| format!("{key}-{value}"))
+            .collect::<Vec<_>>()
+            .join("_"),
+    )
+}
+
+/// Prototype file stem for a block in a given state: `oak_fence__east-true_...`.
+pub fn prototype_stem(block_name: &str, properties: &HashMap<String, String>) -> String {
+    let short = strip_namespace(block_name);
+    match geometry_state_key(block_name, properties) {
+        Some(state) => format!("{short}__{state}"),
+        None => short.to_owned(),
+    }
+}
+
 /// One quad face emitted for a block.
 #[derive(Debug, Clone)]
 pub struct BlockQuad {
@@ -460,5 +514,60 @@ mod tests {
                 "{solid} is solid and must cull its neighbour"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod fence_state_tests {
+    use super::*;
+
+    /// A fence's shape comes entirely from which neighbours it connects to, so
+    /// two different connection states must not produce the same mesh. Before
+    /// prototypes were keyed by state, every fence in a world rendered as
+    /// whichever connection pattern happened to be commonest.
+    #[test]
+    fn fence_geometry_varies_with_connections() {
+        let nothing = |_: i32, _: i32, _: i32| -> Option<&str> { None };
+        let build = |pairs: &[(&str, &str)]| {
+            let props: HashMap<String, String> = pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect();
+            let quads = block_quads_stated(0, 0, 0, "minecraft:oak_fence", &props, &nothing);
+            (quads.len(), prototype_stem("minecraft:oak_fence", &props))
+        };
+
+        let post = build(&[("north", "false"), ("south", "false"), ("east", "false"), ("west", "false")]);
+        let ns = build(&[("north", "true"), ("south", "true"), ("east", "false"), ("west", "false")]);
+        let ew = build(&[("north", "false"), ("south", "false"), ("east", "true"), ("west", "true")]);
+
+        assert!(post.0 > 0, "a bare fence post must still emit geometry");
+        assert!(ns.0 > post.0, "connecting north-south must add rails");
+        assert_eq!(ns.0, ew.0, "two connections is two connections either way");
+        assert_ne!(ns.1, ew.1, "north-south and east-west need different meshes");
+        assert_ne!(post.1, ns.1, "a bare post is not a connected fence");
+    }
+
+    /// Stairs likewise: facing must reach the mesh, or every stair in a world
+    /// points the same way.
+    #[test]
+    fn stair_geometry_varies_with_facing() {
+        let nothing = |_: i32, _: i32, _: i32| -> Option<&str> { None };
+        let build = |facing: &str| {
+            let props: HashMap<String, String> = [
+                ("facing", facing), ("half", "bottom"), ("shape", "straight"),
+            ]
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+            let quads = block_quads_stated(0, 0, 0, "minecraft:oak_stairs", &props, &nothing);
+            let corners: Vec<_> = quads.iter().map(|q| q.corners).collect();
+            (corners, prototype_stem("minecraft:oak_stairs", &props))
+        };
+        let north = build("north");
+        let east = build("east");
+        assert!(!north.0.is_empty(), "stairs must emit geometry");
+        assert_ne!(north.1, east.1, "facings need different meshes");
+        assert_ne!(north.0, east.0, "a north stair is not an east stair");
     }
 }

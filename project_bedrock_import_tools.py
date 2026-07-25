@@ -114,6 +114,163 @@ def hide_meshswap_helpers():
     return hidden
 
 
+# Blocks whose material gets the authored leaf shading. Keyed by suffix so any
+# wood type is covered without listing all of them.
+LEAF_MATERIAL_SUFFIXES = ("_leaves",)
+
+
+def _material_base_color_source(mat):
+    """The node socket feeding Base Color, and the Principled BSDF itself.
+
+    Returns `(principled, source_socket)` or `(None, None)`. MCprep builds
+    either `Image -> Principled` or `Image -> Mix -> Principled`, so the source
+    is whatever is already wired in rather than an assumed node name.
+    """
+    if not mat.use_nodes or not mat.node_tree:
+        return None, None
+    bsdf = next((n for n in mat.node_tree.nodes if n.type == 'BSDF_PRINCIPLED'), None)
+    if bsdf is None:
+        return None, None
+    base = bsdf.inputs.get("Base Color")
+    if base is None or not base.is_linked:
+        return bsdf, None
+    return bsdf, base.links[0].from_socket
+
+
+def apply_leaf_shading(mat):
+    """Authored leaf look: dithered alpha, roughness 0.7, no specular.
+
+    Leaves are cutout geometry seen in dense overlapping layers. Dithered
+    transparency sorts correctly against itself where blended transparency
+    produces ordering artefacts through a canopy.
+    """
+    bsdf, _ = _material_base_color_source(mat)
+    if bsdf is None:
+        return False
+    if hasattr(mat, "surface_render_method"):
+        mat.surface_render_method = 'DITHERED'
+    bsdf.inputs["Roughness"].default_value = 0.7
+    bsdf.inputs["Metallic"].default_value = 0.0
+    if "Specular IOR Level" in bsdf.inputs:
+        bsdf.inputs["Specular IOR Level"].default_value = 0.0
+    if "Transmission Weight" in bsdf.inputs:
+        bsdf.inputs["Transmission Weight"].default_value = 0.0
+    return True
+
+
+def apply_water_shading(mat):
+    """Authored water look: glass/transparent mix over a procedural wave normal.
+
+    Rebuilt from nodes each time rather than appended from a library, so the
+    importer has no external blend dependency. Runs late for the same reason
+    everything else here does: MCprep's `prep_materials` rebuilds a material's
+    node graph from scratch and would discard this.
+    """
+    bsdf, _ = _material_base_color_source(mat)
+    if bsdf is None:
+        return False
+    nt = mat.node_tree
+    nodes, links = nt.nodes, nt.links
+
+    if hasattr(mat, "surface_render_method"):
+        mat.surface_render_method = 'BLENDED'
+
+    bsdf.inputs["Roughness"].default_value = 0.0909
+    bsdf.inputs["IOR"].default_value = 1.333
+    bsdf.inputs["Metallic"].default_value = 0.0
+    if "Transmission Weight" in bsdf.inputs:
+        bsdf.inputs["Transmission Weight"].default_value = 1.0
+    if "Specular IOR Level" in bsdf.inputs:
+        bsdf.inputs["Specular IOR Level"].default_value = 0.0
+
+    output = next((n for n in nodes if n.type == 'OUTPUT_MATERIAL'), None)
+    if output is None:
+        return False
+
+    # Wave normal: Generated coords -> Mapping -> Gabor -> Ramp -> Bump.
+    coord = nodes.new("ShaderNodeTexCoord")
+    coord.location = (-1200, -400)
+    mapping = nodes.new("ShaderNodeMapping")
+    mapping.location = (-1000, -400)
+    mapping.inputs["Rotation"].default_value = (0.5236, 0.0, 0.0)
+    mapping.inputs["Scale"].default_value = (38.15, 38.15, 38.15)
+    links.new(coord.outputs["Generated"], mapping.inputs["Vector"])
+
+    gabor = nodes.new("ShaderNodeTexGabor")
+    gabor.location = (-800, -400)
+    # Orientation is a 3D vector in 3D mode but a single angle in 2D mode, so
+    # the mode has to be set before the value or the assignment type-errors.
+    if hasattr(gabor, "gabor_type"):
+        gabor.gabor_type = '3D'
+    gabor.inputs["Scale"].default_value = 4.9
+    gabor.inputs["Frequency"].default_value = 2.0
+    gabor.inputs["Anisotropy"].default_value = 1.0
+    orientation = gabor.inputs["Orientation"]
+    try:
+        orientation.default_value = (1.4142, 1.4142, 0.0)
+    except TypeError:
+        # 2D Gabor: the equivalent of that vector is its angle in the XY plane.
+        orientation.default_value = math.radians(45.0)
+    links.new(mapping.outputs["Vector"], gabor.inputs["Vector"])
+
+    ramp = nodes.new("ShaderNodeValToRGB")
+    ramp.location = (-600, -400)
+    ramp.color_ramp.elements[0].position = 0.3318
+    ramp.color_ramp.elements[0].color = (0.0, 0.0, 0.0, 1.0)
+    ramp.color_ramp.elements[1].position = 0.6045
+    ramp.color_ramp.elements[1].color = (1.0, 1.0, 1.0, 1.0)
+    links.new(gabor.outputs["Value"], ramp.inputs["Fac"])
+
+    bump = nodes.new("ShaderNodeBump")
+    bump.location = (-400, -400)
+    bump.inputs["Strength"].default_value = 1.0
+    bump.inputs["Distance"].default_value = 0.003
+    links.new(ramp.outputs["Color"], bump.inputs["Height"])
+    links.new(bump.outputs["Normal"], bsdf.inputs["Normal"])
+
+    glass = nodes.new("ShaderNodeBsdfGlass")
+    glass.location = (0, -250)
+    glass.inputs["Color"].default_value = (0.2281, 0.3547, 0.5, 1.0)
+    glass.inputs["Roughness"].default_value = 0.3729
+    glass.inputs["IOR"].default_value = 1.5
+
+    mix_glass = nodes.new("ShaderNodeMixShader")
+    mix_glass.location = (250, -100)
+    mix_glass.inputs["Fac"].default_value = 0.6
+    links.new(bsdf.outputs["BSDF"], mix_glass.inputs[1])
+    links.new(glass.outputs["BSDF"], mix_glass.inputs[2])
+
+    # Without this second mix, stacked water columns accumulate to opaque.
+    transparent = nodes.new("ShaderNodeBsdfTransparent")
+    transparent.location = (250, -350)
+    mix_clear = nodes.new("ShaderNodeMixShader")
+    mix_clear.location = (450, -100)
+    mix_clear.inputs["Fac"].default_value = 0.15
+    links.new(mix_glass.outputs["Shader"], mix_clear.inputs[1])
+    links.new(transparent.outputs["BSDF"], mix_clear.inputs[2])
+    links.new(mix_clear.outputs["Shader"], output.inputs["Surface"])
+    return True
+
+
+def apply_authored_shaders():
+    """Apply the authored leaf and water looks to every material that needs one.
+
+    Returns `(leaves_done, water_done)`.
+    """
+    leaves = water = 0
+    for mat in bpy.data.materials:
+        base = mat.name.split(".")[0].lower()
+        if base.startswith("water"):
+            # Rebuilding an already-converted material would stack duplicate
+            # node chains on every re-import.
+            if any(n.type == 'BSDF_GLASS' for n in (mat.node_tree.nodes if mat.use_nodes and mat.node_tree else [])):
+                continue
+            water += 1 if apply_water_shading(mat) else 0
+        elif base.endswith(LEAF_MATERIAL_SUFFIXES):
+            leaves += 1 if apply_leaf_shading(mat) else 0
+    return leaves, water
+
+
 def set_pixelated_filtering():
     """Force nearest-neighbour sampling on every image texture in the file.
 
@@ -313,17 +470,24 @@ def _build_instancer_node_group(name, asset, is_collection):
     return group
 
 
-def _load_prototype(prototypes_dir, block_name):
-    """Import `prototypes/<block>.obj` and return it as an instancing source.
+def _load_prototype(prototypes_dir, stem, block_name=None):
+    """Import `prototypes/<stem>.obj` and return it as an instancing source.
 
-    The exporter writes one of these per block type: that block's true vanilla
-    geometry, textured from named PNGs taken straight out of the player's
-    client JAR. Instancing it beats drawing the block from the shared atlas —
-    nothing is shared, so no neighbouring tile can bleed along an edge, and a
-    texture is found by name rather than by position in a table that can drift
-    out of step with the atlas image.
+    The exporter writes one of these per distinct block *state*: that state's
+    true vanilla geometry, textured from named PNGs taken straight out of the
+    player's client JAR. Instancing it beats drawing the block from the shared
+    atlas — nothing is shared, so no neighbouring tile can bleed along an edge,
+    and a texture is found by name rather than by position in a table that can
+    drift out of step with the atlas image.
+
+    `stem` carries the block state (`oak_fence__east-true_north-true`), so a
+    fence joined north-south and one joined east-west load as different meshes.
+    `block_name` is the plain block id, used for rules keyed by block type
+    rather than by state; it defaults to the stem for stateless blocks.
     """
-    path = os.path.join(prototypes_dir, f"{block_name}.obj")
+    if block_name is None:
+        block_name = stem
+    path = os.path.join(prototypes_dir, f"{stem}.obj")
     if not os.path.isfile(path):
         return None
     before = set(bpy.data.objects.keys())
@@ -365,7 +529,7 @@ def _load_prototype(prototypes_dir, block_name):
     except Exception:
         pass
 
-    proto.name = f"{PROTOTYPE_PREFIX}{block_name}"
+    proto.name = f"{PROTOTYPE_PREFIX}{stem}"
     if block_name in NO_SHADOW_BLOCKS:
         proto.visible_shadow = False
     # Source only — it must not render on its own.
@@ -418,28 +582,23 @@ def instance_blocks_from_manifest(context, manifest_path, report=None, grass_tuf
             # Two-tall plants (tall_grass, peony, lilac, sunflower) occupy two
             # blocks but the library asset models the whole plant, so placing at
             # both halves would stack two copies. Keep the lower half only.
-            coords = []
+            #
+            # A prototype is built for one *block state*, so variants using
+            # different meshes must become separate instancers: a fence joined
+            # north-south and one joined east-west are not the same shape, and
+            # merging them renders every fence in the world identically. The
+            # exporter names each variant's mesh in `prototype`. MCprep assets
+            # have no per-state variants, so they stay merged under one key.
+            shapes = {}
             for variant in variants:
                 if variant.get("properties", {}).get("half") == "upper":
                     continue
-                # The offset exists to sit an augmenting asset on top of its
-                # block -- a grass tuft above a grass block. A prototype *is*
-                # the block, so lifting it leaves the whole terrain floating a
-                # block too high, with a gap where each block should have been.
-                if use_prototype:
-                    ox, oy, oz = 0.0, 0.0, 0.0
-                else:
-                    ox, oy, oz = MESHSWAP_OFFSETS.get(block_name, (0.0, 0.0, 0.0))
-                for x, y, z in variant["positions"]:
-                    # Manifest is Minecraft-space (Y-up), matching the OBJ's own
-                    # vertices; the importer brings the OBJ in with up_axis='Y',
-                    # forward_axis='NEGATIVE_Z', i.e. (x, y, z) -> (x, -z, y).
-                    coords.append((x + ox, -z + oy, y + oz))
-            if not coords:
-                continue
+                key = variant.get("prototype", block_name) if use_prototype else block_name
+                shapes.setdefault(key, []).append(variant)
 
-            # Resolve the OBJ's own object for this block type *before* appending:
-            # the asset may share its name, after which a lookup is ambiguous.
+            # Resolve the OBJ's own object for this block type *before*
+            # appending: the asset may share its name, after which a lookup is
+            # ambiguous. Removed once, not per shape.
             obj_geometry = bpy.data.objects.get(block_name)
 
             # An asset only augments the block when it is offset away from it
@@ -451,49 +610,73 @@ def instance_blocks_from_manifest(context, manifest_path, report=None, grass_tuf
                 and MESHSWAP_OFFSETS.get(block_name, (0.0, 0.0, 0.0)) != (0.0, 0.0, 0.0)
             )
 
-            if use_prototype:
-                asset = _load_prototype(prototypes_dir, block_name)
-                if asset is None:
-                    skipped.append(block_name)
+            total_placed = 0
+            for shape_key, shape_variants in sorted(shapes.items()):
+                # The offset exists to sit an augmenting asset on top of its
+                # block -- a grass tuft above a grass block. A prototype *is*
+                # the block, so lifting it leaves the terrain floating a block
+                # too high, with a gap where each block should have been.
+                if use_prototype:
+                    ox, oy, oz = 0.0, 0.0, 0.0
+                else:
+                    ox, oy, oz = MESHSWAP_OFFSETS.get(block_name, (0.0, 0.0, 0.0))
+
+                coords = []
+                for variant in shape_variants:
+                    for x, y, z in variant["positions"]:
+                        # Manifest is Minecraft-space (Y-up), matching the OBJ's
+                        # own vertices; the OBJ comes in with up_axis='Y',
+                        # forward_axis='NEGATIVE_Z', i.e. (x, y, z) -> (x, -z, y).
+                        coords.append((x + ox, -z + oy, y + oz))
+                if not coords:
                     continue
-                from_prototype.append(block_name)
-            else:
-                asset = _append_meshswap_asset(blend_path, asset_name, is_collection)
-            if asset is None:
-                skipped.append(block_name)
+
+                if use_prototype:
+                    asset = _load_prototype(prototypes_dir, shape_key, block_name)
+                    if asset is None:
+                        skipped.append(shape_key)
+                        continue
+                    from_prototype.append(shape_key)
+                else:
+                    asset = _append_meshswap_asset(blend_path, asset_name, is_collection)
+                if asset is None:
+                    skipped.append(shape_key)
+                    continue
+                # The asset is only a source for instances — it must not render
+                # in its own right, so keep it out of the scene's collections.
+                if not is_collection:
+                    for coll in list(getattr(asset, "users_collection", []) or []):
+                        coll.objects.unlink(asset)
+                    asset.use_fake_user = True
+
+                mesh = bpy.data.meshes.new(f"PB_points_{shape_key}")
+                mesh.from_pydata(coords, [], [])
+                mesh.update()
+                holder = bpy.data.objects.new(f"PB_{shape_key}", mesh)
+                root.objects.link(holder)
+
+                group = _build_instancer_node_group(
+                    f"PB_Instancer_{shape_key}", asset, is_collection
+                )
+                modifier = holder.modifiers.new("PB_Instancer", 'NODES')
+                modifier.node_group = group
+                total_placed += len(coords)
+
+            if not total_placed:
                 continue
-            # The prototype is only a source for instances — it should not render
-            # in its own right, so keep it out of the scene's collections.
-            if not is_collection:
-                for coll in list(getattr(asset, "users_collection", []) or []):
-                    coll.objects.unlink(asset)
-                asset.use_fake_user = True
-
-            mesh = bpy.data.meshes.new(f"PB_points_{block_name}")
-            mesh.from_pydata(coords, [], [])
-            mesh.update()
-            holder = bpy.data.objects.new(f"PB_{block_name}", mesh)
-            root.objects.link(holder)
-
-            group = _build_instancer_node_group(
-                f"PB_Instancer_{block_name}", asset, is_collection
-            )
-            modifier = holder.modifiers.new("PB_Instancer", 'NODES')
-            modifier.node_group = group
 
             # The OBJ already contains geometry for this block type; leaving it
-            # in place would z-fight with the asset just placed — unless the
-            # asset only *augments* the block (grass tufts sitting on top of a
-            # grass block), in which case the block's own geometry must stay.
+            # in place would z-fight with the assets just placed — unless they
+            # only *augment* the block (a grass tuft on top of a grass block),
+            # in which case the block's own geometry must stay.
             if (
                 obj_geometry is not None
-                and obj_geometry is not holder
-                and obj_geometry is not asset
+                and obj_geometry.name in bpy.data.objects
                 and not augments_block
             ):
                 bpy.data.objects.remove(obj_geometry, do_unlink=True)
 
-            placed[block_name] = len(coords)
+            placed[block_name] = total_placed
       except Exception as exc:
             failed.append(f"{block_name} ({exc})")
 
@@ -785,6 +968,9 @@ class IMPORT_OT_project_bedrock(Operator, ImportHelper):
         # it earlier does not survive: prep_materials rebuilds each material's
         # node graph from scratch, discarding the interpolation set in step 1.
         # Minecraft art is 16x16 pixel texels; any smoothing turns them to mush.
+        # After MCprep and after the prototypes are in, so both the atlas
+        # materials and the prototype materials get the authored look.
+        shaded_leaves, shaded_water = apply_authored_shaders()
         pixelated = set_pixelated_filtering()
         # Runs last so it also catches helpers spawned by MCprep's meshswap,
         # not just those pulled in as append dependencies.

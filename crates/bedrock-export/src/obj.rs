@@ -573,27 +573,26 @@ newmtl {}", group.name)?;
         write_block_manifest(obj_path, center, &block_positions);
 
         if options.write_prototypes {
-            // One representative state per block: the prototype is a single
-            // mesh reused at every position, so it takes the commonest form.
-            let mut representative: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
-            for ((name, props), positions) in &block_positions {
-                let entry = representative.entry(name.clone());
-                match entry {
-                    std::collections::btree_map::Entry::Vacant(slot) => {
-                        slot.insert(props.clone());
-                    }
-                    std::collections::btree_map::Entry::Occupied(mut slot) => {
-                        // Prefer the state with the most occurrences.
-                        let current = block_positions
-                            .get(&(name.clone(), slot.get().clone()))
-                            .map_or(0, Vec::len);
-                        if positions.len() > current {
-                            slot.insert(props.clone());
-                        }
-                    }
-                }
+            // One prototype per distinct block *state*, keyed by the file stem
+            // the importer will look for. Collapsing to a single mesh per block
+            // type is what made every fence in a world take the commonest
+            // fence's shape and every stair face the same way, regardless of
+            // what the save actually said. States that differ only in ways the
+            // model ignores (`waterlogged` and friends) share a stem, so this
+            // costs one mesh per genuinely distinct shape, not per state.
+            let mut wanted: BTreeMap<String, (String, BTreeMap<String, String>)> = BTreeMap::new();
+            for (name, props) in block_positions.keys() {
+                let as_map: HashMap<String, String> = props
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                let stem = block_shape::prototype_stem(name, &as_map);
+                wanted
+                    .entry(stem)
+                    .or_insert_with(|| (name.clone(), props.clone()));
             }
-            let stats = crate::prototypes::write_block_prototypes(obj_path, &representative);
+
+            let stats = crate::prototypes::write_block_prototypes(obj_path, &wanted);
             tracing::info!(
                 "Prototypes: {} block mesh(es), {} texture(s) from the client JAR{}",
                 stats.written,
@@ -640,6 +639,13 @@ struct BlockVariant<'a> {
     /// Block state properties (`facing`, `half`, `axis`, ...). Empty for
     /// blocks with no state. Needed to orient a swapped asset.
     properties: &'a BlockProps,
+    /// Prototype file stem for this state, under `prototypes/`.
+    ///
+    /// Spelled out rather than left for the importer to derive: the stem
+    /// depends on which states the block's *model* reads, which only the
+    /// exporter knows. A fence connected north-south and one connected
+    /// east-west are different meshes and get different stems.
+    prototype: String,
     /// Borrowed rather than copied — these lists get long.
     positions: &'a [[f64; 3]],
 }
@@ -662,6 +668,13 @@ fn write_block_manifest(
             .or_default()
             .push(BlockVariant {
                 properties,
+                prototype: block_shape::prototype_stem(
+                    name,
+                    &properties
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
+                ),
                 positions: positions.as_slice(),
             });
     }
