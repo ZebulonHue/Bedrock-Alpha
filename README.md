@@ -8,7 +8,18 @@ exports a selected region as OBJ or glTF. The included Blender add-on imports
 that export and rebuilds it with real block geometry and MCprep materials
 rather than a field of textured cubes.
 
-## Running the app
+## Installing
+
+**Download the installer** from the
+[Releases page](https://github.com/ZebulonHue/Bedrock-Alpha/releases) and run
+it. Nothing else is needed — no Rust, no cloning. There is a portable `.zip`
+there too if you would rather not install anything.
+
+The installer puts the Blender add-on in `Blender Add-on\` inside the install
+folder and tells you the path on the final screen, since Blender has to
+install it from its own preferences.
+
+## Running from source
 
 **Windows:** double-click `run.bat`.
 

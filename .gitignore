@@ -17,3 +17,6 @@ third_party/Mineways/
 
 # Scratch files
 scratch*.rs
+
+# Installer output
+/dist
