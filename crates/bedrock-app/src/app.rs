@@ -52,6 +52,9 @@ pub struct BedrockApp {
     last_stream_cx: i32,
     last_stream_cz: i32,
     overview_tex: Option<egui::TextureHandle>,
+    /// Pixel-art strip drawn along the bottom of the window. Loaded once and
+    /// kept, since it never changes.
+    banner_tex: Option<egui::TextureHandle>,
     overview_origin: [i32; 2],
     export_region: ExportRegion,
     export_requested: bool,
@@ -96,6 +99,7 @@ impl BedrockApp {
             last_stream_cx: i32::MAX,
             last_stream_cz: i32::MAX,
             overview_tex: None,
+            banner_tex: None,
             overview_origin: [0; 2],
             export_region: ExportRegion {
                 min: [0; 3],
@@ -461,6 +465,59 @@ impl BedrockApp {
         });
     }
 
+    /// Pixel-art grass strip along the bottom edge.
+    ///
+    /// Sits above the status bar so the readable text stays at the very edge
+    /// where it is expected, with the art as a base the window rests on. The
+    /// strip is drawn at its own pixel scale and tiled horizontally rather
+    /// than stretched -- stretching pixel art to an arbitrary window width
+    /// blurs it into mush, which is the one thing this style cannot survive.
+    fn banner(&mut self, ui: &mut egui::Ui) {
+        let texture = self.banner_tex.get_or_insert_with(|| {
+            let bytes = include_bytes!("../../../assets/ui/grass_banner.png");
+            let image = image::load_from_memory(bytes)
+                .expect("bundled assets/ui/grass_banner.png must be valid")
+                .to_rgba8();
+            let (w, h) = image.dimensions();
+            ui.ctx().load_texture(
+                "ui/grass_banner",
+                egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &image),
+                // Nearest-neighbour: this is pixel art and must stay crisp.
+                egui::TextureOptions::NEAREST,
+            )
+        });
+
+        let [tex_w, tex_h] = texture.size();
+        let height = 72.0;
+        let scale = height / tex_h as f32;
+        let tile_w = tex_w as f32 * scale;
+
+        egui::Panel::bottom("art_banner")
+            .exact_size(height)
+            .frame(egui::Frame::NONE.fill(ui.visuals().panel_fill))
+            .show(ui, |ui| {
+                let rect = ui.max_rect();
+                let painter = ui.painter_at(rect);
+                let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                let mut x = rect.left();
+                while x < rect.right() {
+                    let tile = egui::Rect::from_min_size(
+                        egui::pos2(x, rect.top()),
+                        egui::vec2(tile_w.min(rect.right() - x), height),
+                    );
+                    // Trim the UV with the tile so a partial tile at the right
+                    // edge is cropped rather than squashed.
+                    let frac = tile.width() / tile_w;
+                    let uv = egui::Rect::from_min_max(
+                        uv.min,
+                        egui::pos2(uv.min.x + (uv.max.x - uv.min.x) * frac, uv.max.y),
+                    );
+                    painter.image(texture.id(), tile, uv, egui::Color32::WHITE);
+                    x += tile_w;
+                }
+            });
+    }
+
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         egui::Panel::bottom("status_bar")
             .exact_size(26.0)
@@ -613,6 +670,7 @@ impl eframe::App for BedrockApp {
 
         self.menu_bar(ui);
         self.status_bar(ui);
+        self.banner(ui);
 
         egui::CentralPanel::default().show(ui, |ui| {
             let style = egui_dock::Style::from_egui(ui.style().as_ref());
