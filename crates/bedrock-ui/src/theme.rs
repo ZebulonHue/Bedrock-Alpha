@@ -2,9 +2,10 @@
 //!
 //! Colours are sampled from the app's design mock-up rather than invented, so
 //! the built app matches the artwork instead of drifting from it. The palette
-//! is a near-neutral dark green-grey — Minecraft's dirt-and-grass world read
-//! at very low saturation — with plain white as the accent. Colour is left to
-//! the pixel art and the world itself.
+//! is a neutral near-black with white as the accent. The mock-up's own
+//! swatches carry a faint green cast, which reads as olive once it covers a
+//! whole window rather than a small sample, so the hue is dropped and all the
+//! colour is left to the pixel art and the world itself.
 
 use bedrock_settings::Theme;
 use egui::{Color32, CornerRadius, Stroke, Style, Visuals};
@@ -12,22 +13,22 @@ use egui::{Color32, CornerRadius, Stroke, Style, Visuals};
 // ── Palette, sampled from UI-layout_Mockup.png ──────────────────────────────
 
 /// Main content area behind the viewport and panels.
-const BG_APP: Color32 = Color32::from_rgb(0x22, 0x23, 0x21);
+const BG_APP: Color32 = Color32::from_rgb(0x14, 0x14, 0x15);
 /// Left sidebar, a touch darker than the content it sits beside.
-const BG_SIDEBAR: Color32 = Color32::from_rgb(0x1E, 0x20, 0x1E);
+const BG_SIDEBAR: Color32 = Color32::from_rgb(0x0E, 0x0E, 0x0F);
 /// Inset fields — search boxes, text entry, log backgrounds.
-const BG_INSET: Color32 = Color32::from_rgb(0x18, 0x1A, 0x18);
+const BG_INSET: Color32 = Color32::from_rgb(0x1B, 0x1B, 0x1C);
 /// Raised surfaces: cards, menus, dialogs.
-const BG_CARD: Color32 = Color32::from_rgb(0x2E, 0x2F, 0x2B);
+const BG_CARD: Color32 = Color32::from_rgb(0x1E, 0x1E, 0x20);
 /// Hover state for a card or row.
-const BG_HOVER: Color32 = Color32::from_rgb(0x38, 0x39, 0x34);
+const BG_HOVER: Color32 = Color32::from_rgb(0x28, 0x28, 0x2A);
 /// Pressed / open state.
-const BG_ACTIVE: Color32 = Color32::from_rgb(0x44, 0x45, 0x3F);
+const BG_ACTIVE: Color32 = Color32::from_rgb(0x33, 0x33, 0x36);
 
 /// Primary text.
-const TEXT: Color32 = Color32::from_rgb(0xF9, 0xF9, 0xF9);
+pub const TEXT: Color32 = Color32::from_rgb(0xF9, 0xF9, 0xF9);
 /// Section labels and secondary text.
-const TEXT_DIM: Color32 = Color32::from_rgb(0x9A, 0x9C, 0x96);
+pub const TEXT_DIM: Color32 = Color32::from_rgb(0x8E, 0x8E, 0x92);
 
 /// Selection and emphasis. The mock-up underlines the active tab and fills the
 /// selected sidebar row in near-white rather than a colour.
@@ -78,7 +79,7 @@ fn styled(mut visuals: Visuals, dark: bool) -> Style {
 
         // The mock-up has almost no visible borders; surfaces separate by
         // their fill alone. Keeping faint strokes would read as busy beside it.
-        let hairline = Stroke::new(1.0, Color32::from_rgb(0x33, 0x35, 0x31));
+        let hairline = Stroke::new(1.0, Color32::from_rgb(0x2A, 0x2A, 0x2D));
         visuals.widgets.noninteractive.bg_stroke = hairline;
         visuals.widgets.inactive.bg_stroke = Stroke::NONE;
         visuals.widgets.hovered.bg_stroke = Stroke::NONE;

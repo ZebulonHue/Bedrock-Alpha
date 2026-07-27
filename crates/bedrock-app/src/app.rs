@@ -7,12 +7,70 @@ use bedrock_export::gltf::export_gltf;
 use bedrock_export::obj::{export_obj_with_options, ExportOptions, ExportRegion, ExportStats};
 use bedrock_parser::chunk::Chunk;
 use bedrock_parser::detect::WorldSummary;
+use bedrock_ui::dock::{self, Panel};
 use bedrock_parser::mineways::build_mineways_tileset;
 use bedrock_render::mesh::{chunks_to_meshes, ChunkMesh};
 use bedrock_render::{ChunkBorder, SharedScene};
 use bedrock_settings::ExportFormat;
 use bedrock_settings::{layout_path, Settings, Theme};
-use bedrock_ui::dock::{self, Panel, PanelContext};
+
+/// Top-level sections in the sidebar.
+///
+/// Replaces the draggable dock. The design puts navigation in a fixed left
+/// rail with one thing on screen at a time, which is far easier to find your
+/// way around than an arrangement of panels the user has to assemble first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NavSection {
+    Home,
+    Worlds,
+    Exports,
+    Settings,
+}
+
+impl NavSection {
+    const ALL: [NavSection; 4] = [
+        NavSection::Home,
+        NavSection::Worlds,
+        NavSection::Exports,
+        NavSection::Settings,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            NavSection::Home => "Home",
+            NavSection::Worlds => "Worlds",
+            NavSection::Exports => "Exports",
+            NavSection::Settings => "Settings",
+        }
+    }
+
+    fn heading(self) -> &'static str {
+        match self {
+            NavSection::Home => "Project Bedrock",
+            NavSection::Worlds => "Worlds",
+            NavSection::Exports => "Exports",
+            NavSection::Settings => "Settings",
+        }
+    }
+
+    fn subtitle(self) -> &'static str {
+        match self {
+            NavSection::Home => "Prepare for an adventure of limitless possibilities",
+            NavSection::Worlds => "Every save found on this machine",
+            NavSection::Exports => "Choose an area and send it to Blender",
+            NavSection::Settings => "Preferences and diagnostics",
+        }
+    }
+
+    fn tabs(self) -> &'static [&'static str] {
+        match self {
+            NavSection::Home => &["Explore", "Map", "Details", "Log"],
+            NavSection::Worlds => &["Browse"],
+            NavSection::Exports => &["Region", "Log"],
+            NavSection::Settings => &["General", "Debug", "Log"],
+        }
+    }
+}
 
 /// Alias for the channel type returned by the initial world-loading thread.
 type WorldLoadResult = Result<(ActiveWorld, Vec<ChunkMesh>), String>;
@@ -51,10 +109,22 @@ pub struct BedrockApp {
     /// Last camera chunk position (for streaming throttle).
     last_stream_cx: i32,
     last_stream_cz: i32,
+    /// Which sidebar section is showing.
+    nav: NavSection,
+    /// Which tab within that section is showing.
+    nav_tab: usize,
+    /// Sidebar search box contents.
+    search: String,
+    /// Cube mark at the top of the sidebar.
+    logo_tex: Option<egui::TextureHandle>,
+    /// Creeper mark for the current-world row.
+    creeper_tex: Option<egui::TextureHandle>,
     overview_tex: Option<egui::TextureHandle>,
-    /// Pixel-art strip drawn along the bottom of the window. Loaded once and
-    /// kept, since it never changes.
-    banner_tex: Option<egui::TextureHandle>,
+    /// Pixel-art strip along the bottom, in three pieces: the pig end, the
+    /// chicken end, and a tileable stretch of plain grass between them.
+    banner_left: Option<egui::TextureHandle>,
+    banner_mid: Option<egui::TextureHandle>,
+    banner_right: Option<egui::TextureHandle>,
     overview_origin: [i32; 2],
     export_region: ExportRegion,
     export_requested: bool,
@@ -98,8 +168,15 @@ impl BedrockApp {
             active_world: None,
             last_stream_cx: i32::MAX,
             last_stream_cz: i32::MAX,
+            nav: NavSection::Home,
+            nav_tab: 0,
+            search: String::new(),
+            logo_tex: None,
+            creeper_tex: None,
             overview_tex: None,
-            banner_tex: None,
+            banner_left: None,
+            banner_mid: None,
+            banner_right: None,
             overview_origin: [0; 2],
             export_region: ExportRegion {
                 min: [0; 3],
@@ -465,32 +542,187 @@ impl BedrockApp {
         });
     }
 
-    /// Pixel-art grass strip along the bottom edge.
-    ///
-    /// Sits above the status bar so the readable text stays at the very edge
-    /// where it is expected, with the art as a base the window rests on. The
-    /// strip is drawn at its own pixel scale and tiled horizontally rather
-    /// than stretched -- stretching pixel art to an arbitrary window width
-    /// blurs it into mush, which is the one thing this style cannot survive.
-    fn banner(&mut self, ui: &mut egui::Ui) {
-        let texture = self.banner_tex.get_or_insert_with(|| {
-            let bytes = include_bytes!("../../../assets/ui/grass_banner.png");
+    /// Load a bundled PNG as a crisp, never-filtered texture.
+    fn ui_texture(
+        ctx: &egui::Context,
+        slot: &mut Option<egui::TextureHandle>,
+        name: &'static str,
+        bytes: &'static [u8],
+    ) -> egui::TextureHandle {
+        slot.get_or_insert_with(|| {
             let image = image::load_from_memory(bytes)
-                .expect("bundled assets/ui/grass_banner.png must be valid")
+                .expect("bundled UI art must be valid")
                 .to_rgba8();
             let (w, h) = image.dimensions();
-            ui.ctx().load_texture(
-                "ui/grass_banner",
+            ctx.load_texture(
+                name,
                 egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &image),
                 // Nearest-neighbour: this is pixel art and must stay crisp.
                 egui::TextureOptions::NEAREST,
             )
-        });
+        })
+        .clone()
+    }
 
-        let [tex_w, tex_h] = texture.size();
-        let height = 72.0;
-        let scale = height / tex_h as f32;
-        let tile_w = tex_w as f32 * scale;
+    /// Left navigation rail, following the design mock-up.
+    fn sidebar(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let logo = Self::ui_texture(
+            &ctx,
+            &mut self.logo_tex,
+            "ui/cube_logo",
+            include_bytes!("../../../assets/ui/cube_logo.png"),
+        );
+        let creeper = Self::ui_texture(
+            &ctx,
+            &mut self.creeper_tex,
+            "ui/creeper",
+            include_bytes!("../../../assets/ui/creeper.png"),
+        );
+
+        egui::Panel::left("nav_rail")
+            .exact_size(196.0)
+            .frame(
+                egui::Frame::NONE
+                    .fill(bedrock_ui::theme::SIDEBAR)
+                    .inner_margin(egui::Margin::symmetric(12, 14)),
+            )
+            .show(ui, |ui| {
+                ui.add(egui::Image::new(&logo).fit_to_exact_size(egui::vec2(56.0, 56.0)));
+                ui.add_space(14.0);
+
+                egui::Frame::NONE
+                    .fill(ui.visuals().extreme_bg_color)
+                    .corner_radius(egui::CornerRadius::same(8))
+                    .inner_margin(egui::Margin::symmetric(8, 6))
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.search)
+                                .hint_text("Search...")
+                                .frame(egui::Frame::NONE)
+                                .desired_width(f32::INFINITY),
+                        );
+                    });
+
+                ui.add_space(16.0);
+                ui.label(
+                    egui::RichText::new("Navigate")
+                        .size(10.0)
+                        .color(bedrock_ui::theme::MUTED),
+                );
+                ui.add_space(6.0);
+
+                for section in NavSection::ALL {
+                    if Self::nav_row(ui, section.label(), None, self.nav == section) {
+                        self.nav = section;
+                        self.nav_tab = 0;
+                    }
+                }
+
+                ui.add_space(18.0);
+                ui.label(
+                    egui::RichText::new("My Topics")
+                        .size(10.0)
+                        .color(bedrock_ui::theme::MUTED),
+                );
+                ui.add_space(6.0);
+                let world = self
+                    .current_world
+                    .clone()
+                    .unwrap_or_else(|| "No world open".to_owned());
+                Self::nav_row(ui, &world, Some(&creeper), self.current_world.is_some());
+            });
+    }
+
+    /// One sidebar row. Returns true when clicked.
+    ///
+    /// The selected row inverts -- pale fill, dark text -- which is how the
+    /// mock-up marks it, rather than by a coloured accent.
+    fn nav_row(
+        ui: &mut egui::Ui,
+        label: &str,
+        icon: Option<&egui::TextureHandle>,
+        selected: bool,
+    ) -> bool {
+        let height = 30.0;
+        let (rect, response) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), height),
+            egui::Sense::click(),
+        );
+        let painter = ui.painter_at(rect);
+        if selected {
+            painter.rect_filled(rect, egui::CornerRadius::same(7), bedrock_ui::theme::TEXT);
+        } else if response.hovered() {
+            painter.rect_filled(rect, egui::CornerRadius::same(7), bedrock_ui::theme::CARD);
+        }
+        let fg = if selected {
+            bedrock_ui::theme::SIDEBAR
+        } else {
+            bedrock_ui::theme::TEXT
+        };
+        let mut x = rect.left() + 9.0;
+        if let Some(icon) = icon {
+            let size = 20.0;
+            let icon_rect = egui::Rect::from_min_size(
+                egui::pos2(x, rect.center().y - size * 0.5),
+                egui::vec2(size, size),
+            );
+            painter.image(
+                icon.id(),
+                icon_rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+            x += size + 8.0;
+        }
+        painter.text(
+            egui::pos2(x, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            label,
+            egui::FontId::proportional(13.0),
+            fg,
+        );
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        response.clicked()
+    }
+
+    /// Pixel-art grass strip along the bottom edge.
+    ///
+    /// Composed from three pieces rather than one image. The art is a 6.4:1
+    /// scene, so covering a wide window with it whole means either stretching
+    /// it — which flattens the animals — or repeating it, which gives two pigs
+    /// and two chickens. Instead the pig anchors the left, the chicken anchors
+    /// the right, and a clean stretch of grass tiles between them at the same
+    /// scale, so the strip reads as one continuous field at any width.
+    fn banner(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let left = Self::ui_texture(
+            &ctx,
+            &mut self.banner_left,
+            "ui/banner_left",
+            include_bytes!("../../../assets/ui/banner_left.png"),
+        );
+        let mid = Self::ui_texture(
+            &ctx,
+            &mut self.banner_mid,
+            "ui/banner_mid",
+            include_bytes!("../../../assets/ui/banner_mid.png"),
+        );
+        let right = Self::ui_texture(
+            &ctx,
+            &mut self.banner_right,
+            "ui/banner_right",
+            include_bytes!("../../../assets/ui/banner_right.png"),
+        );
+
+        // One scale for every piece, or the ground line would step between
+        // them. Chosen so the art keeps its own proportions.
+        let art_h = left.size()[1] as f32;
+        let height = 96.0;
+        let scale = height / art_h;
+        let full = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
 
         egui::Panel::bottom("art_banner")
             .exact_size(height)
@@ -498,23 +730,30 @@ impl BedrockApp {
             .show(ui, |ui| {
                 let rect = ui.max_rect();
                 let painter = ui.painter_at(rect);
-                let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                let draw = |tex: &egui::TextureHandle, x: f32, w: f32| {
+                    painter.image(
+                        tex.id(),
+                        egui::Rect::from_min_size(
+                            egui::pos2(x, rect.bottom() - height),
+                            egui::vec2(w, height),
+                        ),
+                        full,
+                        egui::Color32::WHITE,
+                    );
+                };
+
+                let lw = left.size()[0] as f32 * scale;
+                let rw = right.size()[0] as f32 * scale;
+                let mw = mid.size()[0] as f32 * scale;
+
+                // Grass first, so the animals sit on top of the seams.
                 let mut x = rect.left();
                 while x < rect.right() {
-                    let tile = egui::Rect::from_min_size(
-                        egui::pos2(x, rect.top()),
-                        egui::vec2(tile_w.min(rect.right() - x), height),
-                    );
-                    // Trim the UV with the tile so a partial tile at the right
-                    // edge is cropped rather than squashed.
-                    let frac = tile.width() / tile_w;
-                    let uv = egui::Rect::from_min_max(
-                        uv.min,
-                        egui::pos2(uv.min.x + (uv.max.x - uv.min.x) * frac, uv.max.y),
-                    );
-                    painter.image(texture.id(), tile, uv, egui::Color32::WHITE);
-                    x += tile_w;
+                    draw(&mid, x, mw.min(rect.right() - x));
+                    x += mw;
                 }
+                draw(&left, rect.left(), lw);
+                draw(&right, rect.right() - rw, rw);
             });
     }
 
@@ -672,28 +911,111 @@ impl eframe::App for BedrockApp {
         self.status_bar(ui);
         self.banner(ui);
 
+        self.sidebar(ui);
+
         egui::CentralPanel::default().show(ui, |ui| {
-            let style = egui_dock::Style::from_egui(ui.style().as_ref());
-            let mut viewer = PanelContext {
-                export: &mut self.settings.export,
-                log: &self.log,
-                auto_scroll_log: &mut self.auto_scroll_log,
-                world_browser: &mut self.world_browser,
-                viewport_scene: &self.scene,
-                export_region: &mut self.export_region,
-                world_loaded: self.active_world.is_some(),
-                export_requested: &mut self.export_requested,
-                overview: self.overview_tex.as_ref().map(|texture| {
-                    bedrock_ui::panels::OverviewData {
-                        texture,
-                        origin: self.overview_origin,
+            let section = self.nav;
+
+            // Heading block, matching the mock-up: a large title, a quiet
+            // subtitle, then the tab row underlined beneath it.
+            ui.add_space(18.0);
+            ui.label(
+                egui::RichText::new(section.heading())
+                    .size(40.0)
+                    .strong()
+                    .color(bedrock_ui::theme::TEXT),
+            );
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new(section.subtitle())
+                    .size(13.0)
+                    .color(bedrock_ui::theme::MUTED),
+            );
+            ui.add_space(16.0);
+
+            let tabs = section.tabs();
+            if self.nav_tab >= tabs.len() {
+                self.nav_tab = 0;
+            }
+            ui.horizontal(|ui| {
+                for (i, name) in tabs.iter().enumerate() {
+                    let selected = i == self.nav_tab;
+                    let colour = if selected {
+                        bedrock_ui::theme::TEXT
+                    } else {
+                        bedrock_ui::theme::MUTED
+                    };
+                    let text = egui::RichText::new(*name).size(14.0).color(colour);
+                    let text = if selected { text.strong() } else { text };
+                    let response = ui
+                        .add(egui::Label::new(text).sense(egui::Sense::click()))
+                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+                    if response.clicked() {
+                        self.nav_tab = i;
                     }
-                }),
-                debug: &mut self.settings.debug,
-            };
-            egui_dock::DockArea::new(&mut self.dock)
-                .style(style)
-                .show_inside(ui, &mut viewer);
+                    // Underline the active tab rather than boxing it, as the
+                    // mock-up does.
+                    if selected {
+                        let r = response.rect;
+                        ui.painter().line_segment(
+                            [
+                                egui::pos2(r.left(), r.bottom() + 5.0),
+                                egui::pos2(r.right(), r.bottom() + 5.0),
+                            ],
+                            egui::Stroke::new(2.0, bedrock_ui::theme::TEXT),
+                        );
+                    }
+                    ui.add_space(12.0);
+                }
+            });
+            ui.add_space(14.0);
+            ui.separator();
+            ui.add_space(8.0);
+
+            let tab = tabs[self.nav_tab];
+            let overview = self.overview_tex.as_ref().map(|texture| {
+                bedrock_ui::panels::OverviewData {
+                    texture,
+                    origin: self.overview_origin,
+                }
+            });
+            match (section, tab) {
+                (NavSection::Home, "Explore") => {
+                    bedrock_ui::panels::viewport(ui, &self.scene);
+                }
+                (NavSection::Home, "Map") | (NavSection::Exports, "Region") => {
+                    if section == NavSection::Exports {
+                        bedrock_ui::panels::export_settings(
+                            ui,
+                            &mut self.settings.export,
+                            &mut self.export_region,
+                            self.active_world.is_some(),
+                            &mut self.export_requested,
+                        );
+                        ui.add_space(8.0);
+                    }
+                    bedrock_ui::panels::overview(ui, overview, &mut self.export_region);
+                }
+                (NavSection::Home, "Details") => bedrock_ui::panels::properties(ui),
+                (NavSection::Worlds, _) => {
+                    bedrock_ui::world_browser::world_browser(ui, &mut self.world_browser);
+                }
+                (NavSection::Settings, "General") => {
+                    bedrock_ui::panels::export_settings(
+                        ui,
+                        &mut self.settings.export,
+                        &mut self.export_region,
+                        self.active_world.is_some(),
+                        &mut self.export_requested,
+                    );
+                }
+                (NavSection::Settings, "Debug") => {
+                    bedrock_ui::panels::debug_settings(ui, &mut self.settings.debug);
+                }
+                _ => {
+                    bedrock_ui::panels::output_log(ui, &self.log, &mut self.auto_scroll_log);
+                }
+            }
         });
 
         if self.show_settings
