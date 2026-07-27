@@ -375,7 +375,14 @@ impl ViewportRenderer {
             }),
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
-                front_face: wgpu::FrontFace::Cw,
+                // `CUBE_FACES` winds every face counter-clockwise seen from
+                // outside the block -- check it by taking the cross product of
+                // two consecutive edges of any entry and comparing against its
+                // declared normal. Declaring Cw here made every outward face a
+                // back face, so culling kept the *interior* of the world and
+                // discarded its surface: the ground vanished and what was left
+                // read as the inside of the columns beneath it.
+                front_face: wgpu::FrontFace::Ccw,
                 cull_mode: Some(wgpu::Face::Back),
                 ..Default::default()
             },
@@ -1249,9 +1256,18 @@ pub fn show_viewport(ui: &mut egui::Ui, shared: &Arc<Mutex<SharedScene>>) {
             interacting = true;
         }
         if response.hovered() {
-            let scroll = ui.input(|input| input.smooth_scroll_delta.y);
+            let (scroll, zoom_modifier) =
+                ui.input(|input| (input.smooth_scroll_delta.y, input.modifiers.ctrl));
             if scroll != 0.0 {
-                camera.zoom(scroll);
+                // Wheel sets how fast WASD flies, the way a flying camera in a
+                // game does -- that is the control wanted while moving around.
+                // Zoom keeps the wheel too, behind Ctrl, since it is still the
+                // natural gesture for it and is otherwise unreachable.
+                if zoom_modifier {
+                    camera.zoom(scroll);
+                } else {
+                    camera.adjust_speed(scroll);
+                }
                 interacting = true;
             }
         }

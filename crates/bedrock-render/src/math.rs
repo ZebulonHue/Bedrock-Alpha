@@ -12,7 +12,17 @@ pub struct Camera {
     pub pitch: f32,
     /// Distance from the target, in blocks.
     pub distance: f32,
+    /// Multiplier on fly speed, driven by the scroll wheel.
+    ///
+    /// Fly speed is otherwise tied to `distance`, which makes close-up work
+    /// crawl and long traverses slow, with no way to override it. Clamped so
+    /// the camera can neither stop dead nor leave the world in one frame.
+    pub speed_scale: f32,
 }
+
+/// Slowest and fastest the scroll wheel may make the fly camera.
+const MIN_SPEED_SCALE: f32 = 0.05;
+const MAX_SPEED_SCALE: f32 = 20.0;
 
 impl Default for Camera {
     fn default() -> Self {
@@ -21,6 +31,7 @@ impl Default for Camera {
             yaw: 0.8,
             pitch: 0.6,
             distance: 140.0,
+            speed_scale: 1.0,
         }
     }
 }
@@ -47,6 +58,15 @@ impl Camera {
         self.target[1] += dy * scale;
     }
 
+    /// Change fly speed by a scroll delta: wheel up faster, wheel down slower.
+    ///
+    /// Multiplicative rather than additive so each notch is the same
+    /// proportional change whether you are crawling or sprinting.
+    pub fn adjust_speed(&mut self, scroll: f32) {
+        let factor = (scroll * 0.004).exp();
+        self.speed_scale = (self.speed_scale * factor).clamp(MIN_SPEED_SCALE, MAX_SPEED_SCALE);
+    }
+
     /// Zoom by a scroll delta (positive scrolls in).
     pub fn zoom(&mut self, scroll: f32) {
         self.distance = (self.distance * (1.0 - scroll * 0.001)).clamp(8.0, 2000.0);
@@ -56,15 +76,18 @@ impl Camera {
     /// −1.0/0.0/1.0, `up/down` are −1.0/0.0/1.0. Movement speed scales with
     /// distance so zoomed-out views travel faster.
     pub fn fly(&mut self, forward: f32, right: f32, up: f32) {
-        let speed = self.distance * 0.03;
+        let speed = self.distance * 0.03 * self.speed_scale;
         let (sin_yaw, cos_yaw) = self.yaw.sin_cos();
         // Forward = direction from eye toward target (negated sin/cos from
         // eye()).
         let fx = -sin_yaw;
         let fz = -cos_yaw;
-        // Right = perpendicular to forward in XZ plane.
-        let rx = -cos_yaw;
-        let rz = sin_yaw;
+        // Right = forward turned a quarter turn clockwise seen from above.
+        // Check it at yaw 0: forward is (0, -1), facing north, so right must
+        // be (1, 0) -- east. The previous signs gave west, which swapped A
+        // and D for every heading.
+        let rx = cos_yaw;
+        let rz = -sin_yaw;
         self.target[0] += (fx * forward + rx * right) * speed;
         self.target[2] += (fz * forward + rz * right) * speed;
         self.target[1] += up * speed;
@@ -178,6 +201,51 @@ mod tests {
         // (0.0, 1.0) but closer to 0.0 than to 1.0.
         let ndc_z = clip[2] / clip[3];
         assert!((0.0..=1.0).contains(&ndc_z), "ndc z {ndc_z} out of range");
+    }
+
+    /// D must move east when facing north, not west. The two directions differ
+    /// only in sign, so an inverted right vector is invisible in isolation and
+    /// only shows up as the controls being mirrored.
+    #[test]
+    fn strafe_right_goes_right() {
+        let mut camera = Camera {
+            yaw: 0.0,
+            target: [0.0, 0.0, 0.0],
+            ..Camera::default()
+        };
+        camera.fly(0.0, 1.0, 0.0);
+        assert!(camera.target[0] > 0.0, "facing north, D must move east (+X)");
+        assert!(camera.target[2].abs() < 1e-3, "strafing must not move along Z");
+
+        // Facing west (yaw = 90 degrees), right is north (-Z).
+        let mut camera = Camera {
+            yaw: std::f32::consts::FRAC_PI_2,
+            target: [0.0, 0.0, 0.0],
+            ..Camera::default()
+        };
+        camera.fly(0.0, 1.0, 0.0);
+        assert!(camera.target[2] < 0.0, "facing west, D must move north (-Z)");
+    }
+
+    /// Wheel up speeds the camera up, wheel down slows it, and neither can run
+    /// away: at the limits the camera must still be able to move, and must not
+    /// cross the world in a frame.
+    #[test]
+    fn scroll_changes_speed_within_limits() {
+        let mut camera = Camera::default();
+        let base = camera.speed_scale;
+        camera.adjust_speed(120.0);
+        assert!(camera.speed_scale > base, "wheel up must speed up");
+        camera.adjust_speed(-240.0);
+        assert!(camera.speed_scale < base, "wheel down must slow down");
+        for _ in 0..200 {
+            camera.adjust_speed(-1000.0);
+        }
+        assert_eq!(camera.speed_scale, MIN_SPEED_SCALE);
+        for _ in 0..200 {
+            camera.adjust_speed(1000.0);
+        }
+        assert_eq!(camera.speed_scale, MAX_SPEED_SCALE);
     }
 
     #[test]

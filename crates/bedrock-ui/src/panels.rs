@@ -25,7 +25,7 @@ pub struct OverviewData<'a> {
 
 /// 2D overview: top-down map of the loaded world with the export region
 /// drawn as a rectangle.
-pub fn overview(ui: &mut egui::Ui, data: Option<OverviewData>, region: &ExportRegion) {
+pub fn overview(ui: &mut egui::Ui, data: Option<OverviewData>, region: &mut ExportRegion) {
     let Some(data) = data else {
         ui.vertical_centered(|ui| {
             ui.add_space(48.0);
@@ -35,7 +35,8 @@ pub fn overview(ui: &mut egui::Ui, data: Option<OverviewData>, region: &ExportRe
     };
 
     let [width, height] = data.texture.size();
-    let (outer, _) = ui.allocate_exact_size(ui.available_size(), egui::Sense::hover());
+    let (outer, response) =
+        ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
     let scale = (outer.width() / width as f32)
         .min(outer.height() / height as f32)
         .max(0.01);
@@ -58,6 +59,50 @@ pub fn overview(ui: &mut egui::Ui, data: Option<OverviewData>, region: &ExportRe
             rect.top() + (wz - data.origin[1]) as f32 * scale,
         )
     };
+    // Right-drag anywhere on the map to box out a new export region, the way
+    // Mineways does. Right rather than left so it cannot be mistaken for a
+    // pan, and it leaves the left button free for later selection tools.
+    //
+    // The press origin has to live in egui's memory: `drag_delta` alone only
+    // gives the movement since the last frame, which is not enough to
+    // reconstruct the rectangle the user is drawing.
+    let drag_id = ui.id().with("overview_drag_origin");
+    let to_world = |pos: egui::Pos2| -> [i32; 2] {
+        [
+            data.origin[0] + ((pos.x - rect.left()) / scale).round() as i32,
+            data.origin[1] + ((pos.y - rect.top()) / scale).round() as i32,
+        ]
+    };
+
+    if response.drag_started_by(egui::PointerButton::Secondary) {
+        if let Some(pos) = response.interact_pointer_pos() {
+            ui.memory_mut(|m| m.data.insert_temp(drag_id, pos));
+        }
+    }
+    let drag_origin: Option<egui::Pos2> = ui.memory(|m| m.data.get_temp(drag_id));
+
+    if let (Some(start), Some(now)) = (drag_origin, response.interact_pointer_pos()) {
+        // Live preview while the button is held.
+        painter.rect_stroke(
+            egui::Rect::from_two_pos(start, now),
+            0.0,
+            egui::Stroke::new(1.0, Color32::from_rgb(255, 214, 92)),
+            egui::StrokeKind::Outside,
+        );
+        if response.drag_stopped() {
+            let (a, b) = (to_world(start), to_world(now));
+            // A click without movement would otherwise commit an empty region
+            // and export nothing.
+            if (a[0] - b[0]).abs() >= 1 && (a[1] - b[1]).abs() >= 1 {
+                region.min[0] = a[0].min(b[0]);
+                region.max[0] = a[0].max(b[0]);
+                region.min[2] = a[1].min(b[1]);
+                region.max[2] = a[1].max(b[1]);
+            }
+            ui.memory_mut(|m| m.data.remove::<egui::Pos2>(drag_id));
+        }
+    }
+
     let region_rect = egui::Rect::from_two_pos(
         to_screen(region.min[0], region.min[2]),
         to_screen(region.max[0], region.max[2]),
