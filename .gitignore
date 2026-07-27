@@ -14,3 +14,6 @@ extracted_mc_assets.zip
 
 # Vendored for reference only (275 MB); check out separately if needed.
 third_party/Mineways/
+
+# Scratch files
+scratch*.rs
