@@ -1180,6 +1180,70 @@ pub fn build_mineways_tileset(texture_keys: &[String]) -> crate::texture::FaceAw
 ///
 /// Returns `(block_name, texture_name, tile_pixels)`. Blocks with no matching
 /// texture are simply absent from the result.
+/// Further texture names to try for a block whose own name finds nothing.
+///
+/// The JAR does not ship a texture per *block*; it ships one per *image*, and
+/// several block families borrow another block's image rather than owning one.
+/// Without these the blocks fall through to plain stone, which is both wrong
+/// and silent unless you read the log.
+fn texture_aliases(block: &str) -> Vec<String> {
+    let mut out = Vec::new();
+
+    // `*_wood` and `*_hyphae` are the all-bark variants of a log or stem, and
+    // reuse that block's side texture rather than shipping their own.
+    if let Some(base) = block.strip_suffix("_wood") {
+        out.push(format!("{base}_log"));
+    }
+    if let Some(base) = block.strip_suffix("_hyphae") {
+        out.push(format!("{base}_stem"));
+    }
+    // Stripped variants follow the same rule one level down.
+    if let Some(base) = block.strip_suffix("_wood").and_then(|b| b.strip_prefix("stripped_")) {
+        out.push(format!("stripped_{base}_log"));
+    }
+
+    // Signs, banners and heads are drawn by the game from entity textures, so
+    // there is no block image at all. Fall back to the material they are made
+    // of: wrong in detail, but the right colour and far better than stone.
+    if let Some(base) = block
+        .strip_suffix("_wall_hanging_sign")
+        .or_else(|| block.strip_suffix("_hanging_sign"))
+        .or_else(|| block.strip_suffix("_wall_sign"))
+        .or_else(|| block.strip_suffix("_sign"))
+    {
+        out.push(format!("{base}_planks"));
+    }
+    if block.ends_with("_banner") {
+        out.push("white_wool".to_owned());
+    }
+
+    match block {
+        // A bubble column is water with rising bubbles; the water surface is
+        // the only part with an image.
+        "bubble_column" => out.push("water_still".to_owned()),
+        // Mob heads are entity-rendered. Approximate with the mob's block.
+        "piglin_head" | "piglin_wall_head" => out.push("nether_bricks".to_owned()),
+        "player_head" | "player_wall_head" => out.push("dirt".to_owned()),
+        "skeleton_skull" | "skeleton_wall_skull" | "wither_skeleton_skull"
+        | "wither_skeleton_wall_skull" => out.push("bone_block_side".to_owned()),
+        "zombie_head" | "zombie_wall_head" => out.push("moss_block".to_owned()),
+        "creeper_head" | "creeper_wall_head" => out.push("green_wool".to_owned()),
+        "dragon_head" | "dragon_wall_head" => out.push("black_wool".to_owned()),
+        _ => {}
+    }
+
+    // A slab, stair, wall or fence borrows its parent block's texture.
+    for suffix in ["_slab", "_stairs", "_wall", "_fence"] {
+        if let Some(base) = block.strip_suffix(suffix) {
+            out.push(base.to_owned());
+            out.push(format!("{base}_block"));
+            out.push(format!("{base}s"));
+        }
+    }
+
+    out
+}
+
 fn collect_jar_tiles(blocks: &[&str]) -> Vec<(String, String, Vec<u8>)> {
     let loader = match crate::jar_textures::JarTextureLoader::load() {
         Ok(l) => l,
@@ -1194,12 +1258,13 @@ fn collect_jar_tiles(blocks: &[&str]) -> Vec<(String, String, Vec<u8>)> {
         // Exact name, then the usual per-face spellings, then any texture
         // whose name starts with the block's (multi-part blocks such as
         // `sulfur_spike` only ship `sulfur_spike_up_base` and friends).
-        let direct = [
+        let mut direct = vec![
             block.to_owned(),
             format!("{block}_top"),
             format!("{block}_side"),
             format!("{block}_still"),
         ];
+        direct.extend(texture_aliases(block));
         let found = direct
             .iter()
             .find_map(|n| loader.get(n).map(|b| (n.clone(), b)))
