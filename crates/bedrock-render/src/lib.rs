@@ -361,7 +361,15 @@ impl ViewportRenderer {
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    // No blending. The fragment shader already discards texels
+                    // below an alpha threshold, which is how Minecraft draws
+                    // cutout blocks — leaves, plants, rails — and unlike
+                    // blending it does not care what order geometry arrives
+                    // in. Blending on top of that made every partly
+                    // transparent texel composite against whatever chunk
+                    // happened to be drawn before it, smearing the terrain
+                    // into vertical streaks that shifted as the camera moved.
+                    blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),

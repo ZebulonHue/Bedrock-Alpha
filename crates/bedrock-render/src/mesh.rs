@@ -139,7 +139,13 @@ where
                 bounds_max[0] = bounds_max[0].max(wx + 1);
                 bounds_max[1] = bounds_max[1].max(y + 1);
                 bounds_max[2] = bounds_max[2].max(wz + 1);
-                let quads = block_shape::block_quads(wx, y, wz, name, lookup);
+                // Pass the block state, not just the id. Without it a fence
+                // matches only its always-present post and loses every rail,
+                // and a stair matches no variant at all so it falls back to a
+                // plain cube -- which is why neither was recognisable in the
+                // viewport while both exported correctly.
+                let quads =
+                    block_shape::block_quads_stated(wx, y, wz, name, &state.properties, lookup);
                 for quad in &quads {
                     let [u0, v0, u1, v1] = if let Some(tex) = &quad.texture {
                         tiles.tile_uv(tex)
