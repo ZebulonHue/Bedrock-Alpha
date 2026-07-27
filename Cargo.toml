@@ -49,6 +49,10 @@ tracing-subscriber = "0.3"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 rfd = "0.15"
 embed-resource = "3"
+# Background-media audio playback; decoded PCM comes from ffmpeg, this just
+# opens the output device and streams it.
+rodio = { version = "0.19", default-features = false }
+rand = "0.8"
 
 # --- Minecraft world data (Phase 2-3) ---
 flate2 = "1"

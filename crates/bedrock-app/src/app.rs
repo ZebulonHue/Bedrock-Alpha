@@ -67,7 +67,7 @@ impl NavSection {
             NavSection::Home => &["Explore", "Map", "Details", "Log"],
             NavSection::Worlds => &["Browse"],
             NavSection::Exports => &["Region", "Log"],
-            NavSection::Settings => &["General", "Debug", "Log"],
+            NavSection::Settings => &["General", "Background", "Debug", "Log"],
         }
     }
 }
@@ -117,6 +117,20 @@ pub struct BedrockApp {
     search: String,
     /// Cube mark at the top of the sidebar.
     logo_tex: Option<egui::TextureHandle>,
+    /// Running background video/audio playback, if configured and ffmpeg is
+    /// available. `None` covers "not configured", "ffmpeg missing", and
+    /// "failed to start" alike -- the UI does not need to tell those apart.
+    background: Option<crate::background_media::BackgroundMedia>,
+    /// (path, audio-on, blur) this session's `background` was started with,
+    /// so a change in Settings can be noticed and acted on once, not
+    /// re-triggered every frame.
+    background_started_for: Option<(std::path::PathBuf, bool, u32)>,
+    /// Blur value at the end of the last completed slider drag. Restarting
+    /// ffmpeg on every intermediate value while the slider is being dragged
+    /// would spawn dozens of processes in a second; this only updates -- and
+    /// so only triggers a restart -- once the drag finishes.
+    background_blur_committed: f32,
+    background_tex: Option<egui::TextureHandle>,
     /// Creeper mark for the current-world row.
     creeper_tex: Option<egui::TextureHandle>,
     overview_tex: Option<egui::TextureHandle>,
@@ -153,6 +167,7 @@ impl BedrockApp {
 
         let mut app = Self {
             applied_theme: settings.theme,
+            background_blur_committed: settings.background_media_blur,
             settings,
             dock,
             log,
@@ -172,6 +187,9 @@ impl BedrockApp {
             nav_tab: 0,
             search: String::new(),
             logo_tex: None,
+            background: None,
+            background_started_for: None,
+            background_tex: None,
             creeper_tex: None,
             overview_tex: None,
             banner_left: None,
@@ -542,6 +560,191 @@ impl BedrockApp {
         });
     }
 
+    /// Reconcile the running background video/audio against Settings, pull
+    /// any new frame, and paint it on egui's `Background` layer -- beneath
+    /// every panel, so it is only visible where a panel lets it through.
+    fn update_background_media(&mut self, ctx: &egui::Context) {
+        // Blur is keyed into the restart comparison as bits, not the raw
+        // f32: `f32` has no `Eq`, and only the committed (post-drag) value
+        // ever lands here, so exact-bits comparison is exactly what is
+        // wanted -- it changes only when the user actually finishes moving
+        // the slider, never from float noise.
+        let wanted = self.settings.background_media_path.clone().map(|p| {
+            (
+                p,
+                self.settings.background_media_audio,
+                self.background_blur_committed.to_bits(),
+            )
+        });
+
+        if wanted != self.background_started_for {
+            tracing::info!(
+                "background media restart: {:?} -> {:?}",
+                self.background_started_for, wanted
+            );
+            // Old ffmpeg children are killed by `BackgroundMedia::drop`, so
+            // simply replacing the value here is enough to stop them.
+            self.background = wanted.as_ref().and_then(|(path, audio, blur_bits)| {
+                crate::background_media::BackgroundMedia::start(
+                    path,
+                    *audio,
+                    f32::from_bits(*blur_bits),
+                    self.settings.background_media_volume,
+                )
+            });
+            self.background_started_for = wanted;
+            // Recorded even on failure (ffmpeg missing, bad file): otherwise
+            // a failed start would retry, and log, every single frame.
+        }
+
+        let Some(background) = self.background.as_mut() else {
+            return;
+        };
+        // Volume, unlike blur or the file, changes live -- no restart.
+        background.set_volume(self.settings.background_media_volume);
+        if let Some(frame) = background.latest_frame() {
+            let [w, h] = crate::background_media::BackgroundMedia::FRAME_SIZE;
+            let image = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &frame.rgba);
+            match &mut self.background_tex {
+                Some(tex) => tex.set(image, egui::TextureOptions::LINEAR),
+                None => {
+                    self.background_tex =
+                        Some(ctx.load_texture("ui/background_media", image, egui::TextureOptions::LINEAR));
+                }
+            }
+        }
+        let Some(tex) = &self.background_tex else {
+            return;
+        };
+
+        let screen = ctx.content_rect();
+        let [tw, th] = crate::background_media::BackgroundMedia::FRAME_SIZE;
+        let tex_aspect = tw as f32 / th as f32;
+        let screen_aspect = (screen.width() / screen.height()).max(1e-3);
+
+        // Cover-fit: crop rather than letterbox. This is an ambient backdrop,
+        // not content to see in full, and it is already blurred, so cropping
+        // a margin off any edge costs nothing visible.
+        let uv = if screen_aspect > tex_aspect {
+            let crop = (1.0 - tex_aspect / screen_aspect) * 0.5;
+            egui::Rect::from_min_max(egui::pos2(0.0, crop), egui::pos2(1.0, 1.0 - crop))
+        } else {
+            let crop = (1.0 - screen_aspect / tex_aspect) * 0.5;
+            egui::Rect::from_min_max(egui::pos2(crop, 0.0), egui::pos2(1.0 - crop, 1.0))
+        };
+
+        ctx.layer_painter(egui::LayerId::background())
+            .image(tex.id(), screen, uv, egui::Color32::WHITE);
+    }
+
+    /// Panel-fill alpha for the sidebar/content backdrops: fully opaque when
+    /// no background video is running (identical to before this feature
+    /// existed), otherwise driven by the opacity setting. Floored well above
+    /// zero so text stays legible at any slider position.
+    fn panel_veil_alpha(&self) -> u8 {
+        if self.background.is_none() {
+            return 255;
+        }
+        let t = self.settings.background_media_opacity.clamp(0.0, 1.0);
+        (255.0 - t * 130.0).round() as u8
+    }
+
+    /// Background media settings: pick a local video, toggle its audio, set
+    /// how much it shows through the UI.
+    fn background_settings(&mut self, ui: &mut egui::Ui) {
+        ui.label(
+            egui::RichText::new(
+                "Plays a local video file, blurred, behind the app, with a random \
+                 start point. The file stays wherever it already is on disk -- only \
+                 its path is remembered.",
+            )
+            .color(bedrock_ui::theme::MUTED)
+            .size(12.0),
+        );
+        ui.add_space(10.0);
+
+        if !crate::background_media::ffmpeg_available() {
+            ui.colored_label(
+                egui::Color32::from_rgb(224, 176, 90),
+                "ffmpeg was not found on PATH, so this is unavailable. \
+                 Install it (e.g. `winget install ffmpeg`) and restart the app.",
+            );
+            ui.add_space(8.0);
+        }
+
+        ui.horizontal(|ui| {
+            let current = self
+                .settings
+                .background_media_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "No file selected".to_owned());
+            ui.label(current);
+            if ui.button("Browse...").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Video", &["webm", "mp4", "mkv", "mov", "avi"])
+                    .pick_file()
+                {
+                    self.settings.background_media_path = Some(path);
+                    self.settings.save();
+                }
+            }
+            if self.settings.background_media_path.is_some() && ui.button("Clear").clicked() {
+                self.settings.background_media_path = None;
+                self.settings.save();
+            }
+        });
+
+        ui.add_space(10.0);
+        if ui
+            .checkbox(&mut self.settings.background_media_audio, "Play audio")
+            .changed()
+        {
+            self.settings.save();
+        }
+        ui.add_space(6.0);
+
+        ui.horizontal(|ui| {
+            ui.label("How much shows through the UI:");
+            if ui
+                .add(egui::Slider::new(&mut self.settings.background_media_opacity, 0.0..=1.0).show_value(false))
+                .changed()
+            {
+                self.settings.save();
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Volume:");
+            // Applied continuously in `update_background_media`, not only on
+            // release: this is a `Sink::set_volume` call, not a process
+            // restart, so there is no cost to updating it every frame the
+            // slider is moving.
+            if ui
+                .add(egui::Slider::new(&mut self.settings.background_media_volume, 0.0..=1.0).show_value(false))
+                .changed()
+            {
+                self.settings.save();
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Blur:");
+            let response = ui.add(
+                egui::Slider::new(&mut self.settings.background_media_blur, 0.0..=30.0).show_value(false),
+            );
+            // Committed only when the drag ends: unlike volume, blur is baked
+            // into the frames by ffmpeg's own filter, so changing it means
+            // restarting decoding. Committing every intermediate value while
+            // dragging would spawn a new ffmpeg process on every pixel of
+            // mouse movement.
+            if response.drag_stopped() || response.lost_focus() {
+                self.background_blur_committed = self.settings.background_media_blur;
+                self.settings.save();
+            }
+        });
+    }
+
     /// Load a bundled PNG as a crisp, never-filtered texture.
     fn ui_texture(
         ctx: &egui::Context,
@@ -580,11 +783,12 @@ impl BedrockApp {
             include_bytes!("../../../assets/ui/creeper.png"),
         );
 
+        let veil = self.panel_veil_alpha();
         egui::Panel::left("nav_rail")
             .exact_size(196.0)
             .frame(
                 egui::Frame::NONE
-                    .fill(bedrock_ui::theme::SIDEBAR)
+                    .fill(bedrock_ui::theme::SIDEBAR.gamma_multiply_u8(veil))
                     .inner_margin(egui::Margin::symmetric(12, 14)),
             )
             .show(ui, |ui| {
@@ -800,6 +1004,7 @@ impl eframe::App for BedrockApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.fps.tick();
+        self.update_background_media(&ctx);
         self.world_browser.poll(&ctx);
         self.poll_world_load(&ctx);
         self.poll_export(&ctx);
@@ -913,7 +1118,10 @@ impl eframe::App for BedrockApp {
 
         self.sidebar(ui);
 
-        egui::CentralPanel::default().show(ui, |ui| {
+        let veil = self.panel_veil_alpha();
+        egui::CentralPanel::default()
+            .frame(egui::Frame::central_panel(ui.style()).fill(ui.visuals().panel_fill.gamma_multiply_u8(veil)))
+            .show(ui, |ui| {
             let section = self.nav;
 
             // Heading block, matching the mock-up: a large title, a quiet
@@ -1009,6 +1217,7 @@ impl eframe::App for BedrockApp {
                         &mut self.export_requested,
                     );
                 }
+                (NavSection::Settings, "Background") => self.background_settings(ui),
                 (NavSection::Settings, "Debug") => {
                     bedrock_ui::panels::debug_settings(ui, &mut self.settings.debug);
                 }

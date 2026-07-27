@@ -173,7 +173,11 @@ pub struct DebugSettings {
 }
 
 /// Root settings object, persisted as TOML.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Eq` dropped: `background_media_opacity` is an `f32`, which cannot
+/// implement it. Nothing in the app compares two whole `Settings` values for
+/// exact equality.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     /// UI theme.
@@ -192,6 +196,25 @@ pub struct Settings {
     pub load_radius_chunks: i32,
     /// Debug visualisation settings (Phase 6b).
     pub debug: DebugSettings,
+    /// A local video file to play, blurred, behind the UI, with its audio.
+    ///
+    /// Deliberately just a path, never file contents: the app has no business
+    /// copying whatever the user points it at, and it means nothing about the
+    /// file itself is ever written into settings.json or committed anywhere.
+    /// `None` until the user sets one in Settings.
+    pub background_media_path: Option<PathBuf>,
+    /// Play audio from the background media. Off mutes it without unloading
+    /// the video, so silencing it does not also lose the picture.
+    pub background_media_audio: bool,
+    /// Opacity of the background video behind the UI, 0.0 (invisible) to 1.0.
+    pub background_media_opacity: f32,
+    /// Background audio volume, 0.0 (silent) to 1.0.
+    pub background_media_volume: f32,
+    /// Gaussian blur strength (ffmpeg `gblur` sigma) applied to the video.
+    /// 0 is unblurred; higher softens it further. Changing this restarts
+    /// decoding, since ffmpeg bakes the blur into the frames it produces
+    /// rather than it being adjustable after the fact.
+    pub background_media_blur: f32,
 }
 
 impl Default for Settings {
@@ -204,6 +227,11 @@ impl Default for Settings {
             export: ExportPreferences::default(),
             load_radius_chunks: DEFAULT_LOAD_RADIUS_CHUNKS,
             debug: DebugSettings::default(),
+            background_media_path: None,
+            background_media_audio: true,
+            background_media_opacity: 0.28,
+            background_media_volume: 0.6,
+            background_media_blur: 14.0,
         }
     }
 }
