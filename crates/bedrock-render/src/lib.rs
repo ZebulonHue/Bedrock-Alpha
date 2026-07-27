@@ -817,6 +817,7 @@ impl ViewportRenderer {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         meshes: Vec<ChunkMesh>,
+        build_wireframe: bool,
     ) {
         let mut seen: HashMap<mesh::ChunkId, bool> = HashMap::new();
         // Build combined vertex data + wireframe indices.
@@ -824,8 +825,25 @@ impl ViewportRenderer {
         let mut wire_indices: Vec<u32> = Vec::new();
         let mut base_vertex: u32 = 0;
 
+        // Hard ceiling on chunk geometry held on the GPU. Without one, a large
+        // world simply allocates until the driver refuses and the process dies
+        // with "wgpu error: Out of Memory" -- no warning, no partial view.
+        // Dropping the chunks that do not fit keeps the app alive and usable;
+        // the log says how many were left out so the cause is not a mystery.
+        const MAX_CHUNK_BYTES: u64 = 1024 * 1024 * 1024;
+        let mut uploaded_bytes: u64 = 0;
+        let mut skipped_chunks: usize = 0;
+
         for chunk_mesh in meshes {
             let key = chunk_mesh.id;
+
+            let chunk_bytes = (chunk_mesh.vertices.len() * size_of::<mesh::Vertex>()
+                + chunk_mesh.indices.len() * size_of::<u32>()) as u64;
+            if uploaded_bytes + chunk_bytes > MAX_CHUNK_BYTES {
+                skipped_chunks += 1;
+                continue;
+            }
+            uploaded_bytes += chunk_bytes;
             seen.insert(key, true);
 
             // Per-chunk GPU buffers for frustum-culled drawing.
@@ -844,20 +862,23 @@ impl ViewportRenderer {
             queue.write_buffer(&vbuf, 0, bytemuck::cast_slice(&chunk_mesh.vertices));
             queue.write_buffer(&ibuf, 0, bytemuck::cast_slice(&chunk_mesh.indices));
 
-            // Append to combined vertex buffer (for wireframe overlay).
-            combined_verts.extend_from_slice(&chunk_mesh.vertices);
-
-            // Generate wireframe edges from this chunk's indices.
-            for tri in chunk_mesh.indices.chunks(3) {
-                if tri.len() < 3 {
-                    continue;
+            // The wireframe overlay needs a second copy of every vertex and
+            // six indices per triangle -- more memory than the geometry it
+            // annotates. It is an F5 debug toggle, so build it only when it is
+            // actually switched on rather than for every world on every load.
+            if build_wireframe {
+                combined_verts.extend_from_slice(&chunk_mesh.vertices);
+                for tri in chunk_mesh.indices.chunks(3) {
+                    if tri.len() < 3 {
+                        continue;
+                    }
+                    let i0 = tri[0] + base_vertex;
+                    let i1 = tri[1] + base_vertex;
+                    let i2 = tri[2] + base_vertex;
+                    wire_indices.extend_from_slice(&[i0, i1, i1, i2, i2, i0]);
                 }
-                let i0 = tri[0] + base_vertex;
-                let i1 = tri[1] + base_vertex;
-                let i2 = tri[2] + base_vertex;
-                wire_indices.extend_from_slice(&[i0, i1, i1, i2, i2, i0]);
+                base_vertex += chunk_mesh.vertices.len() as u32;
             }
-            base_vertex += chunk_mesh.vertices.len() as u32;
 
             self.chunk_cache.insert(
                 key,
@@ -870,6 +891,14 @@ impl ViewportRenderer {
                 },
             );
         }
+        if skipped_chunks > 0 {
+            tracing::warn!(
+                "GPU geometry budget reached ({} MiB): {} chunk(s) not shown.                  Lower the load radius in Settings to see a smaller area in full.",
+                MAX_CHUNK_BYTES / (1024 * 1024),
+                skipped_chunks,
+            );
+        }
+
         // Evict chunks that are no longer present.
         self.chunk_cache.retain(|key, _| seen.contains_key(key));
 
@@ -1071,7 +1100,7 @@ impl CallbackTrait for ViewportCallback {
         if let Some(meshes) = pending_chunks {
             let verts: usize = meshes.iter().map(|m| m.vertices.len()).sum();
             let tris: usize = meshes.iter().map(|m| m.triangle_count()).sum();
-            renderer.update_chunk_cache(device, queue, meshes);
+            renderer.update_chunk_cache(device, queue, meshes, debug.show_wireframe);
             renderer
                 .shared
                 .lock()
