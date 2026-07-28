@@ -386,7 +386,13 @@ fn spawn_video(
     // well-tested filter, and doing it here means the renderer only ever
     // handles an already-finished image.
     let mut child = Command::new(ffmpeg)
-        .args(["-ss", &start_at.to_string(), "-i"])
+        // `-re` paces output to the video's own frame rate. Without it ffmpeg
+        // decodes as fast as the CPU allows and the background plays at
+        // roughly 8x speed -- measured, not estimated. The `fps` filter below
+        // only resamples the frame rate; it does nothing to pace against the
+        // clock. The channel back to the UI cannot throttle this either,
+        // since each repaint drains every queued frame and keeps the newest.
+        .args(["-re", "-ss", &start_at.to_string(), "-i"])
         .arg(media)
         .args([
             "-loglevel",
