@@ -751,6 +751,7 @@ impl BedrockApp {
         slot: &mut Option<egui::TextureHandle>,
         name: &'static str,
         bytes: &'static [u8],
+        options: egui::TextureOptions,
     ) -> egui::TextureHandle {
         slot.get_or_insert_with(|| {
             let image = image::load_from_memory(bytes)
@@ -760,8 +761,7 @@ impl BedrockApp {
             ctx.load_texture(
                 name,
                 egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &image),
-                // Nearest-neighbour: this is pixel art and must stay crisp.
-                egui::TextureOptions::NEAREST,
+                options,
             )
         })
         .clone()
@@ -770,17 +770,23 @@ impl BedrockApp {
     /// Left navigation rail, following the design mock-up.
     fn sidebar(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        // Linear, not nearest: this is smooth flat-shaded vector-style art
+        // (see tools/generate_icon.py), displayed well below its 256px source
+        // size, unlike the pixel-art banner and creeper below it. Nearest
+        // filtering would turn its clean anti-aliased edges jagged.
         let logo = Self::ui_texture(
             &ctx,
             &mut self.logo_tex,
             "ui/cube_logo",
             include_bytes!("../../../assets/ui/cube_logo.png"),
+            egui::TextureOptions::LINEAR,
         );
         let creeper = Self::ui_texture(
             &ctx,
             &mut self.creeper_tex,
             "ui/creeper",
             include_bytes!("../../../assets/ui/creeper.png"),
+            egui::TextureOptions::NEAREST,
         );
 
         let veil = self.panel_veil_alpha();
@@ -907,18 +913,21 @@ impl BedrockApp {
             &mut self.banner_left,
             "ui/banner_left",
             include_bytes!("../../../assets/ui/banner_left.png"),
+            egui::TextureOptions::NEAREST,
         );
         let mid = Self::ui_texture(
             &ctx,
             &mut self.banner_mid,
             "ui/banner_mid",
             include_bytes!("../../../assets/ui/banner_mid.png"),
+            egui::TextureOptions::NEAREST,
         );
         let right = Self::ui_texture(
             &ctx,
             &mut self.banner_right,
             "ui/banner_right",
             include_bytes!("../../../assets/ui/banner_right.png"),
+            egui::TextureOptions::NEAREST,
         );
 
         // One scale for every piece, or the ground line would step between
@@ -1189,7 +1198,31 @@ impl eframe::App for BedrockApp {
             });
             match (section, tab) {
                 (NavSection::Home, "Explore") => {
-                    bedrock_ui::panels::viewport(ui, &self.scene);
+                    if self.active_world.is_some() {
+                        bedrock_ui::panels::viewport(ui, &self.scene);
+                    } else {
+                        // The viewport's own paint callback clears to a solid
+                        // colour and blits it with no blending -- correct once
+                        // a world is loaded, but with nothing loaded it was
+                        // an opaque rectangle sitting on top of the background
+                        // video and the translucent panel fill behind it,
+                        // hiding both completely regardless of the blur or
+                        // opacity sliders. Skipping the 3D paint callback
+                        // entirely here, rather than trying to make it
+                        // draw transparently, is what lets that show through.
+                        ui.allocate_space(ui.available_size());
+                        ui.put(
+                            egui::Rect::from_center_size(
+                                ui.max_rect().center(),
+                                egui::vec2(320.0, 40.0),
+                            ),
+                            egui::Label::new(
+                                egui::RichText::new("Open a world to see it here")
+                                    .color(bedrock_ui::theme::MUTED)
+                                    .size(14.0),
+                            ),
+                        );
+                    }
                 }
                 (NavSection::Home, "Map") | (NavSection::Exports, "Region") => {
                     if section == NavSection::Exports {
