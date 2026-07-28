@@ -121,15 +121,11 @@ pub struct BedrockApp {
     /// available. `None` covers "not configured", "ffmpeg missing", and
     /// "failed to start" alike -- the UI does not need to tell those apart.
     background: Option<crate::background_media::BackgroundMedia>,
-    /// (path, audio-on, blur) this session's `background` was started with,
-    /// so a change in Settings can be noticed and acted on once, not
-    /// re-triggered every frame.
-    background_started_for: Option<(std::path::PathBuf, bool, u32)>,
-    /// Blur value at the end of the last completed slider drag. Restarting
-    /// ffmpeg on every intermediate value while the slider is being dragged
-    /// would spawn dozens of processes in a second; this only updates -- and
-    /// so only triggers a restart -- once the drag finishes.
-    background_blur_committed: f32,
+    /// (path, audio-on) this session's `background` was started with, so a
+    /// change in Settings can be noticed and acted on once, not re-triggered
+    /// every frame. Blur is deliberately absent: it no longer restarts
+    /// anything.
+    background_started_for: Option<(std::path::PathBuf, bool)>,
     background_tex: Option<egui::TextureHandle>,
     /// Creeper mark for the current-world row.
     creeper_tex: Option<egui::TextureHandle>,
@@ -167,7 +163,6 @@ impl BedrockApp {
 
         let mut app = Self {
             applied_theme: settings.theme,
-            background_blur_committed: settings.background_media_blur,
             settings,
             dock,
             log,
@@ -564,18 +559,16 @@ impl BedrockApp {
     /// any new frame, and paint it on egui's `Background` layer -- beneath
     /// every panel, so it is only visible where a panel lets it through.
     fn update_background_media(&mut self, ctx: &egui::Context) {
-        // Blur is keyed into the restart comparison as bits, not the raw
-        // f32: `f32` has no `Eq`, and only the committed (post-drag) value
-        // ever lands here, so exact-bits comparison is exactly what is
-        // wanted -- it changes only when the user actually finishes moving
-        // the slider, never from float noise.
-        let wanted = self.settings.background_media_path.clone().map(|p| {
-            (
-                p,
-                self.settings.background_media_audio,
-                self.background_blur_committed.to_bits(),
-            )
-        });
+        // Only the file and the audio toggle can force a restart. Blur used
+        // to be part of this key, which is why changing it froze the picture
+        // and jumped the audio to a new random point: it tore down and
+        // respawned both ffmpeg processes. It is now applied per frame on the
+        // decode thread instead.
+        let wanted = self
+            .settings
+            .background_media_path
+            .clone()
+            .map(|p| (p, self.settings.background_media_audio));
 
         if wanted != self.background_started_for {
             tracing::info!(
@@ -584,11 +577,11 @@ impl BedrockApp {
             );
             // Old ffmpeg children are killed by `BackgroundMedia::drop`, so
             // simply replacing the value here is enough to stop them.
-            self.background = wanted.as_ref().and_then(|(path, audio, blur_bits)| {
+            self.background = wanted.as_ref().and_then(|(path, audio)| {
                 crate::background_media::BackgroundMedia::start(
                     path,
                     *audio,
-                    f32::from_bits(*blur_bits),
+                    self.settings.background_media_blur,
                     self.settings.background_media_volume,
                 )
             });
@@ -600,10 +593,24 @@ impl BedrockApp {
         let Some(background) = self.background.as_mut() else {
             return;
         };
+
+        // egui repaints on demand: with no input it simply stops calling this,
+        // and a video that only advances when the mouse moves is not a video.
+        // Nothing drained the frame channel either, so the decode thread
+        // filled its buffer and blocked after a couple of frames -- which is
+        // why the background appeared frozen or absent rather than merely
+        // stuttering. Asking for a repaint at the decode frame rate is what
+        // makes it play on its own.
+        ctx.request_repaint_after(std::time::Duration::from_millis(
+            (1000 / crate::background_media::FRAME_FPS.max(1)) as u64,
+        ));
         // Volume, unlike blur or the file, changes live -- no restart.
         background.set_volume(self.settings.background_media_volume);
+        background.set_blur(self.settings.background_media_blur);
         let frame_arrived = if let Some(frame) = background.latest_frame() {
-            let [w, h] = crate::background_media::BackgroundMedia::FRAME_SIZE;
+            // Size comes from the frame, not a constant: blurred frames are
+            // computed at a reduced size, so it varies with the setting.
+            let (w, h) = (frame.width, frame.height);
             let image = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &frame.rgba);
             match &mut self.background_tex {
                 Some(tex) => tex.set(image, egui::TextureOptions::LINEAR),
@@ -621,8 +628,8 @@ impl BedrockApp {
         };
 
         let screen = ctx.content_rect();
-        let [tw, th] = crate::background_media::BackgroundMedia::FRAME_SIZE;
-        let tex_aspect = tw as f32 / th as f32;
+        let [tw, th] = tex.size();
+        let tex_aspect = tw as f32 / th.max(1) as f32;
         let screen_aspect = (screen.width() / screen.height()).max(1e-3);
 
         // Cover-fit: crop rather than letterbox. This is an ambient backdrop,
@@ -741,16 +748,12 @@ impl BedrockApp {
 
         ui.horizontal(|ui| {
             ui.label("Blur:");
-            let response = ui.add(
-                egui::Slider::new(&mut self.settings.background_media_blur, 0.0..=30.0).show_value(false),
-            );
-            // Committed only when the drag ends: unlike volume, blur is baked
-            // into the frames by ffmpeg's own filter, so changing it means
-            // restarting decoding. Committing every intermediate value while
-            // dragging would spawn a new ffmpeg process on every pixel of
-            // mouse movement.
-            if response.drag_stopped() || response.lost_focus() {
-                self.background_blur_committed = self.settings.background_media_blur;
+            // Continuous, like volume: blur is applied per frame on the decode
+            // thread now, so dragging costs nothing and takes effect at once.
+            if ui
+                .add(egui::Slider::new(&mut self.settings.background_media_blur, 0.0..=30.0).show_value(false))
+                .changed()
+            {
                 self.settings.save();
             }
         });

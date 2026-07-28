@@ -1,35 +1,33 @@
 #!/usr/bin/env python3
 """Generate the Project Bedrock application icons.
 
-Two icon designs, used at the sizes each one actually works at, decided by
-rendering both and comparing them directly rather than by guessing:
+The executable icon is the white creeper mark. It is the right shape for the
+job for a specific, checkable reason: an icon is mostly seen at 16-32px in a
+title bar and taskbar, and only bold flat regions with hard contrast survive
+that. The creeper is a white rounded square with three near-black cutouts and
+nothing else, so it stays perfectly legible at 16px. The project's detailed
+amethyst-cube artwork does not — it is a fine-grained PBR-style texture, and
+rendering it at 16/24/32/48px and comparing showed it turning to an
+indistinct dark smudge below roughly 48px, whatever cropping or contrast
+boosting was applied first.
 
-  * assets/ui/detailed_cube.png — the project's real amethyst-cube artwork.
-    Genuinely reads once there is enough resolution for its facets and
-    texture to register: legible from 48px up, confirmed by rendering it at
-    16/24/32/48/64px and comparing side by side. Below 48px it is an
-    indistinct dark smudge no matter how it is cropped or contrast-boosted —
-    all three were tried before concluding this, not assumed.
-
-  * A flat-shaded isometric block, in the style of Minecraft's own icon:
-    three plain colour facets and a bold outline, nothing else. Used only
-    where the real art fails -- 16/24/32px, i.e. the title bar and taskbar,
-    the two places an icon is seen constantly rather than glanced at. Its
-    palette is sampled from the real artwork so the identity still carries
-    over even though the rendering style doesn't.
+The cube stays as the sidebar mark, where it is displayed around 56px and
+reads properly.
 
 Output:
-    assets/icon.png            window/title-bar icon at runtime (flat glyph:
-                                that context is always tiny on screen)
+    assets/icon.png             window/title-bar icon (creeper)
     assets/icon.ico             embedded into the EXE by
-                                crates/bedrock-app/build.rs -- flat glyph at
-                                16/24/32px, real artwork at 48px and above,
-                                so Explorer/Alt-Tab/large-icon views show the
-                                real art while the taskbar stays legible
-    assets/ui/cube_logo.png     sidebar mark, real artwork (displayed at
-                                ~56px, comfortably inside the range it reads)
+                                crates/bedrock-app/build.rs, all sizes creeper
+    assets/ui/cube_logo.png     sidebar mark (cube artwork)
 
-Re-run after changing the design:
+Sources, both already trimmed of transparent padding — untrimmed art wastes
+most of its frame and renders visibly smaller than the size it is given,
+which is what made earlier icons look undersized no matter what number they
+were drawn at:
+    assets/ui/creeper.png
+    assets/ui/detailed_cube.png
+
+Re-run after changing the artwork:
     python tools/generate_icon.py
 """
 
@@ -37,90 +35,45 @@ import struct
 from io import BytesIO
 from pathlib import Path
 
-from PIL import Image, ImageDraw
+from PIL import Image
 
 ROOT = Path(__file__).resolve().parent.parent
-DETAILED_SOURCE = ROOT / "assets" / "ui" / "detailed_cube.png"
+CREEPER_SOURCE = ROOT / "assets" / "ui" / "creeper.png"
+CUBE_SOURCE = ROOT / "assets" / "ui" / "detailed_cube.png"
 
-# Sampled from the real artwork: a bright lavender facet, a deep violet
-# facet, and a near-black outline. `LEFT` is a blend between them so the
-# three faces read as one consistent material rather than two unrelated
-# colours plus a shadow.
-TOP = (0x9E, 0x8A, 0xDA, 255)
-LEFT = (0x6A, 0x55, 0xC4, 255)
-RIGHT = (0x3A, 0x27, 0xB1, 255)
-OUTLINE = (0x0A, 0x08, 0x10, 255)
-
-# Below this, only the flat glyph is legible; at and above it the real
-# artwork is. See the module docstring for how this boundary was found.
-REAL_ART_MIN_SIZE = 48
+# Sizes Windows asks for: 16 in the title bar and Explorer lists, 32 in the
+# taskbar and Alt-Tab, up to 256 for large-icon views.
 ICO_SIZES = [16, 24, 32, 48, 64, 128, 256]
 
 
-def draw_block_icon(size: int, supersample: int = 8) -> Image.Image:
-    """One flat-shaded isometric block at `size`x`size`, transparent background.
+def square(img: Image.Image, size: int) -> Image.Image:
+    """Fit `img` into a transparent `size`x`size` frame, preserving aspect.
 
-    Drawn at `supersample`x and downscaled with Lanczos rather than drawn
-    directly at the target size: `ImageDraw.polygon` has no anti-aliasing of
-    its own, and without it every edge of a 16px cube is a visible staircase.
-    This resampling trick is only correct here because the source is flat
-    vector-like shapes -- the exact opposite of the detailed cube texture
-    this glyph exists to stand in for.
+    Art is not always square — the cube is taller than it is wide — and
+    stretching it to a square frame would distort it. This scales the long
+    edge to fit and centres the result.
     """
-    s = size * supersample
-    img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
-
-    cx = s / 2
-    half_w = s * 0.42
-    top_h = s * 0.24
-    side_h = s * 0.40
-    top_y = s * 0.5 - side_h * 0.5
-
-    top_pt = (cx, top_y - top_h * 0.5)
-    left_pt = (cx - half_w, top_y + top_h * 0.25)
-    right_pt = (cx + half_w, top_y + top_h * 0.25)
-    front_pt = (cx, top_y + top_h)
-
-    left_bot = (left_pt[0], left_pt[1] + side_h)
-    right_bot = (right_pt[0], right_pt[1] + side_h)
-    front_bot = (front_pt[0], front_pt[1] + side_h)
-
-    d.polygon([top_pt, right_pt, front_pt, left_pt], fill=TOP)
-    d.polygon([left_pt, front_pt, front_bot, left_bot], fill=LEFT)
-    d.polygon([right_pt, front_pt, front_bot, right_bot], fill=RIGHT)
-
-    width = max(1, s // 48)
-    for poly in (
-        [top_pt, right_pt, front_pt, left_pt, top_pt],
-        [left_pt, front_pt, front_bot, left_bot, left_pt],
-        [right_pt, front_pt, front_bot, right_bot, right_pt],
-    ):
-        d.line(poly, fill=OUTLINE, width=width, joint="curve")
-
-    return img.resize((size, size), Image.LANCZOS)
-
-
-def icon_at(size: int, detailed: Image.Image) -> Image.Image:
-    """The right design for `size`, real artwork or flat glyph."""
-    if size >= REAL_ART_MIN_SIZE:
-        return detailed.resize((size, size), Image.LANCZOS)
-    return draw_block_icon(size)
+    img = img.crop(img.getbbox())
+    scale = size / max(img.width, img.height)
+    w = max(1, round(img.width * scale))
+    h = max(1, round(img.height * scale))
+    resized = img.resize((w, h), Image.LANCZOS)
+    frame = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    frame.paste(resized, ((size - w) // 2, (size - h) // 2), resized)
+    return frame
 
 
 def write_ico(path: Path, images: list[Image.Image]) -> None:
-    """Write a multi-size .ico with PNG-compressed frames, one PNG per size.
+    """Write a multi-size .ico with PNG-compressed frames.
 
-    Pillow's own `Image.save(..., format="ICO", sizes=[...])` only resizes a
-    single source image for every requested size, which cannot mix two
-    different designs into one file. The ICO container itself is simple
-    enough to write directly: a 6-byte directory header, one 16-byte entry
-    per frame, then the PNG-encoded frames back to back. Every modern
-    Windows version accepts PNG-compressed ICO frames at any size, not only
-    256px, so no legacy BMP encoding is needed.
+    Written directly rather than via `Image.save(format="ICO")` so each size
+    is an independently prepared image: Pillow's writer resizes one source
+    for every entry, which gives no control over per-size treatment. The
+    container is simple — a 6-byte header, a 16-byte directory entry per
+    frame, then the PNG data. Modern Windows accepts PNG-compressed frames at
+    any size, so no legacy BMP encoding is needed.
     """
-    entries = []
-    frames = []
+    entries, frames = [], []
     offset = 6 + 16 * len(images)
     for img in images:
         buf = BytesIO()
@@ -134,34 +87,28 @@ def write_ico(path: Path, images: list[Image.Image]) -> None:
 
     with open(path, "wb") as f:
         f.write(struct.pack("<HHH", 0, 1, len(images)))
-        for e in entries:
-            f.write(e)
+        for entry in entries:
+            f.write(entry)
         for frame in frames:
             f.write(frame)
 
 
 def main() -> int:
-    if not DETAILED_SOURCE.is_file():
-        print(f"missing {DETAILED_SOURCE} -- the real cube artwork must exist first")
-        return 1
-    detailed = Image.open(DETAILED_SOURCE).convert("RGBA")
+    for source in (CREEPER_SOURCE, CUBE_SOURCE):
+        if not source.is_file():
+            print(f"missing {source}")
+            return 1
 
-    # Window/title-bar icon: always shown tiny on screen, so always the flat
-    # glyph regardless of what size PNG is provided -- there is no OS-level
-    # per-size selection for this one, unlike the .ico.
-    draw_block_icon(256).save(ROOT / "assets" / "icon.png")
+    creeper = Image.open(CREEPER_SOURCE).convert("RGBA")
+    cube = Image.open(CUBE_SOURCE).convert("RGBA")
 
-    write_ico(
-        ROOT / "assets" / "icon.ico",
-        [icon_at(s, detailed) for s in ICO_SIZES],
-    )
+    square(creeper, 256).save(ROOT / "assets" / "icon.png")
+    write_ico(ROOT / "assets" / "icon.ico", [square(creeper, s) for s in ICO_SIZES])
+    square(cube, 256).save(ROOT / "assets" / "ui" / "cube_logo.png")
 
-    (ROOT / "assets" / "ui").mkdir(parents=True, exist_ok=True)
-    detailed.resize((256, 256), Image.LANCZOS).save(ROOT / "assets" / "ui" / "cube_logo.png")
-
-    print(f"wrote {ROOT / 'assets' / 'icon.png'} (flat glyph)")
-    print(f"wrote {ROOT / 'assets' / 'icon.ico'}: flat glyph <{REAL_ART_MIN_SIZE}px, real artwork >=")
-    print(f"wrote {ROOT / 'assets' / 'ui' / 'cube_logo.png'} (real artwork)")
+    print(f"wrote {ROOT / 'assets' / 'icon.png'} (creeper)")
+    print(f"wrote {ROOT / 'assets' / 'icon.ico'} (creeper, {len(ICO_SIZES)} sizes)")
+    print(f"wrote {ROOT / 'assets' / 'ui' / 'cube_logo.png'} (cube)")
     return 0
 
 
