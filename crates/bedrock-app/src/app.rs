@@ -602,7 +602,7 @@ impl BedrockApp {
         };
         // Volume, unlike blur or the file, changes live -- no restart.
         background.set_volume(self.settings.background_media_volume);
-        if let Some(frame) = background.latest_frame() {
+        let frame_arrived = if let Some(frame) = background.latest_frame() {
             let [w, h] = crate::background_media::BackgroundMedia::FRAME_SIZE;
             let image = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &frame.rgba);
             match &mut self.background_tex {
@@ -612,7 +612,10 @@ impl BedrockApp {
                         Some(ctx.load_texture("ui/background_media", image, egui::TextureOptions::LINEAR));
                 }
             }
-        }
+            true
+        } else {
+            false
+        };
         let Some(tex) = &self.background_tex else {
             return;
         };
@@ -635,6 +638,7 @@ impl BedrockApp {
 
         ctx.layer_painter(egui::LayerId::background())
             .image(tex.id(), screen, uv, egui::Color32::WHITE);
+        let _ = frame_arrived;
     }
 
     /// Panel-fill alpha for the sidebar/content backdrops: fully opaque when
@@ -646,7 +650,14 @@ impl BedrockApp {
             return 255;
         }
         let t = self.settings.background_media_opacity.clamp(0.0, 1.0);
-        (255.0 - t * 130.0).round() as u8
+        // Range widened from 255..=125 (49% see-through at most) to 255..=45
+        // (82%): verified by direct instrumentation that frames, the screen
+        // rect, and this alpha value were all already correct end-to-end at
+        // max opacity, yet at 125 the effect read as "nothing changed" --
+        // dark blurred video under an already-dark panel just wasn't a
+        // visible enough shift. Floored at 45, not 0, so panel text stays
+        // legible at every setting rather than the UI vanishing entirely.
+        (255.0 - t * 210.0).round() as u8
     }
 
     /// Background media settings: pick a local video, toggle its audio, set
