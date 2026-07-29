@@ -255,36 +255,59 @@ fn scan_bedrock(worlds_dir: &Path, out: &mut Vec<WorldSummary>) {
         if !folder.is_dir() {
             continue;
         }
-        let name = std::fs::read_to_string(folder.join("levelname.txt"))
-            .ok()
-            .map(|s| s.trim().to_owned())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| {
-                folder
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "Unknown world".to_owned())
-            });
-        let level_dat = folder.join("level.dat");
-        if !level_dat.is_file() {
-            continue;
+        if let Ok(world) = open_bedrock_world(&folder) {
+            out.push(world);
         }
-        let last_played_ms = std::fs::metadata(&level_dat)
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_millis() as i64);
-        let icon = folder.join("world_icon.jpeg");
-        out.push(WorldSummary {
-            edition: Edition::Bedrock,
-            size_bytes: dir_size(&folder),
-            folder,
-            name,
-            icon: icon.is_file().then_some(icon),
-            last_played_ms,
-            data_version: None,
-        });
     }
+}
+
+/// Turn one Bedrock world folder into a [`WorldSummary`].
+///
+/// The Bedrock counterpart of [`open_java_world`], and for the same reason:
+/// the auto-scan and "Open Folder…" must build a world the same way or the
+/// two drift apart. A folder a friend sent over is the identical thing to one
+/// the scan found in the game's own directory -- the only difference is where
+/// it happens to sit.
+///
+/// A Bedrock world is identified by its `db/` LevelDB directory. Testing for
+/// `level.dat` alone cannot tell the editions apart, because Bedrock saves
+/// carry one too (in a different format Java's reader rejects).
+pub fn open_bedrock_world(folder: &Path) -> Result<WorldSummary, String> {
+    if !folder.join("db").is_dir() {
+        return Err(format!(
+            "'{}' has no db/ folder, so it is not a Bedrock world",
+            folder.display()
+        ));
+    }
+    let level_dat = folder.join("level.dat");
+    if !level_dat.is_file() {
+        return Err(format!("'{}' has no level.dat", folder.display()));
+    }
+    let name = std::fs::read_to_string(folder.join("levelname.txt"))
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            folder
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "Unknown world".to_owned())
+        });
+    let last_played_ms = std::fs::metadata(&level_dat)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64);
+    let icon = folder.join("world_icon.jpeg");
+    Ok(WorldSummary {
+        edition: Edition::Bedrock,
+        size_bytes: dir_size(folder),
+        folder: folder.to_path_buf(),
+        name,
+        icon: icon.is_file().then_some(icon),
+        last_played_ms,
+        data_version: None,
+    })
 }
 
 /// Total size of a directory tree in bytes (best effort, ignores errors).
@@ -411,7 +434,10 @@ mod tests {
     fn bedrock_world_uses_levelname_txt() {
         let worlds_dir = temp_dir("bedrock");
         let world = worlds_dir.join("abc123=");
-        std::fs::create_dir_all(&world).unwrap();
+        // `db/` is what makes it a Bedrock world: that is where its chunks
+        // live, and it is the only thing distinguishing the editions, since
+        // both carry a `level.dat`.
+        std::fs::create_dir_all(world.join("db")).unwrap();
         std::fs::write(world.join("levelname.txt"), "Bedrock Base\n").unwrap();
         std::fs::write(world.join("level.dat"), b"placeholder").unwrap();
 
@@ -422,6 +448,37 @@ mod tests {
         assert_eq!(worlds[0].edition, Edition::Bedrock);
         assert_eq!(worlds[0].name, "Bedrock Base");
         assert!(worlds[0].last_played_ms.is_some());
+
+        let _ = std::fs::remove_dir_all(&worlds_dir);
+    }
+
+    #[test]
+    fn bedrock_open_needs_a_db_folder() {
+        // Without `db/` there are no chunks to read, and nothing separates the
+        // folder from a Java save — both have a `level.dat`. Opening it as
+        // Bedrock has to fail rather than produce a world that cannot load.
+        let worlds_dir = temp_dir("bedrock_nodb");
+        let world = worlds_dir.join("def456=");
+        std::fs::create_dir_all(&world).unwrap();
+        std::fs::write(world.join("level.dat"), b"placeholder").unwrap();
+
+        assert!(open_bedrock_world(&world).is_err());
+
+        let _ = std::fs::remove_dir_all(&worlds_dir);
+    }
+
+    #[test]
+    fn bedrock_falls_back_to_the_folder_name() {
+        // Shared saves turn up with an empty or missing levelname.txt; the
+        // encoded folder name is a poor label but beats a blank card.
+        let worlds_dir = temp_dir("bedrock_noname");
+        let world = worlds_dir.join("ghi789=");
+        std::fs::create_dir_all(world.join("db")).unwrap();
+        std::fs::write(world.join("levelname.txt"), "   \n").unwrap();
+        std::fs::write(world.join("level.dat"), b"placeholder").unwrap();
+
+        let opened = open_bedrock_world(&world).expect("world opens");
+        assert_eq!(opened.name, "ghi789=");
 
         let _ = std::fs::remove_dir_all(&worlds_dir);
     }

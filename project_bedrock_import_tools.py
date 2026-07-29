@@ -99,7 +99,16 @@ def hide_meshswap_helpers():
         stem = low.rsplit(".", 1)
         if len(stem) == 2 and stem[1].isdigit():
             low = stem[0]
-        return low.endswith((".flame", ".smoke"))
+        if low.endswith((".flame", ".smoke")):
+            return True
+        # MCprep does not name every emitter `<asset>.flame`: the campfire and
+        # lantern families bring `smoke_flame.large` / `smoke_flame.med`, whose
+        # suffix is the size, not the role. Matching only on the suffix let
+        # those through, and they render exactly as the others would -- a
+        # flame animation strip mapped whole across one quad, which reads as a
+        # slab of scrambled colour hanging in mid-air beside the block.
+        first = low.split(".", 1)[0]
+        return first in ("smoke_flame", "smoke_gray", "fire_animation")
 
     hidden = 0
     for ob in list(bpy.data.objects):
@@ -271,6 +280,49 @@ def apply_authored_shaders():
     return leaves, water
 
 
+def neutralise_mcprep_tint():
+    """Stop MCprep's tint node from multiplying every texture toward black.
+
+    `prep_materials` inserts a MULTIPLY mix node ("Add Color") between the
+    diffuse texture and Base Color, meant to carry a biome tint -- but leaves
+    its colour input at Blender's default for an unset colour socket, 0.5
+    grey, with the factor at 1.0. Multiplying by mid grey halves every
+    texture, on every block of the import, which reads as a scene that is
+    simply too dark rather than as one material being wrong.
+
+    Our exporter bakes biome tint into the atlas swatches already, so the
+    node has nothing to contribute: white makes the multiply an identity.
+    Only the unset default is replaced -- a linked input, or any colour the
+    user or MCprep deliberately set, is left alone.
+
+    Returns the number of tint sockets corrected.
+    """
+    # Blender's default for an unset colour socket, and so the signature of a
+    # tint nobody filled in.
+    UNSET = 0.5
+    fixed = 0
+    for mat in bpy.data.materials:
+        if not mat.use_nodes or not mat.node_tree:
+            continue
+        for node in mat.node_tree.nodes:
+            if node.bl_idname not in ("ShaderNodeMix", "ShaderNodeMixRGB"):
+                continue
+            if getattr(node, "blend_type", None) != 'MULTIPLY':
+                continue
+            for socket in node.inputs:
+                # `ShaderNodeMix` carries one A/B pair per data type and only
+                # the pair matching `data_type` is live, so match on the
+                # socket type rather than the name. The texture arrives on a
+                # link; the tint is the unlinked one.
+                if socket.type != 'RGBA' or socket.is_linked:
+                    continue
+                value = socket.default_value
+                if all(abs(value[i] - UNSET) < 0.01 for i in range(3)):
+                    socket.default_value = (1.0, 1.0, 1.0, 1.0)
+                    fixed += 1
+    return fixed
+
+
 def set_pixelated_filtering():
     """Force nearest-neighbour sampling on every image texture in the file.
 
@@ -397,7 +449,10 @@ def _append_meshswap_asset(blend_path, name, is_collection):
     added = [key for key in store.keys() if key not in before]
     if not added:
         # Already present from an earlier import; reuse it.
-        return store.get(name)
+        existing = store.get(name)
+        if is_collection:
+            _unlink_collection_from_scenes(existing)
+        return existing
     # Prefer the block that actually came from this append.
     chosen = None
     for key in added:
@@ -421,8 +476,66 @@ def _append_meshswap_asset(blend_path, name, is_collection):
             for coll in list(extra.users_collection):
                 coll.objects.unlink(extra)
             extra.use_fake_user = True
+    else:
+        _unlink_collection_from_scenes(chosen)
+        _centre_collection_for_instancing(chosen)
 
     return chosen
+
+
+def _centre_collection_for_instancing(collection):
+    """Move a collection's instancing origin onto its own contents.
+
+    MCprep's library assets are laid out on a display grid inside the blend, so
+    a collection's meshes sit at arbitrary offsets from its origin -- the soul
+    lantern's parts are at (-2.5, 5.5, 0.5). Instancing preserves that, so
+    every lantern appeared displaced from the block it belongs to rather than
+    on it, which reads as the asset floating away from its fence post.
+
+    `instance_offset` is the collection's own answer to this: it defines the
+    point that lands on the instance position. Setting it to the centre of the
+    mesh contents puts the asset where the block is. Lights and other
+    non-geometry are ignored on purpose -- an emitter parked away from the
+    model would drag the centre off the thing you can actually see.
+    """
+    meshes = [ob for ob in collection.all_objects if ob.type == 'MESH']
+    if not meshes:
+        return
+    xs = [ob.location.x for ob in meshes]
+    ys = [ob.location.y for ob in meshes]
+    # Z uses the minimum, not the mean: a block sits *on* its position, so the
+    # bottom of the asset is what should meet it. Averaging would half-bury a
+    # tall asset like a door or a hanging lantern.
+    zs = [ob.location.z for ob in meshes]
+    collection.instance_offset = (
+        sum(xs) / len(xs),
+        sum(ys) / len(ys),
+        min(zs),
+    )
+
+
+def _unlink_collection_from_scenes(asset):
+    """Take an appended asset collection out of every scene, keeping the data.
+
+    Appending a *collection* links it into the scene, so its objects render
+    where the meshswap library authored them -- next to nothing, in the middle
+    of the world. The instancer only ever needs the datablock, so the visible
+    copy is pure surplus: every torch and lantern shows up as its real
+    instances *plus* the stray library copy sitting off on its own, which is
+    what a torch appearing three times where one should be actually is. Object
+    assets were already handled this way; collections were not.
+    """
+    if asset is None or not hasattr(asset, "children"):
+        return
+    for scene in bpy.data.scenes:
+        if asset.name in scene.collection.children:
+            scene.collection.children.unlink(asset)
+    for parent in bpy.data.collections:
+        if parent is asset:
+            continue
+        if asset.name in parent.children:
+            parent.children.unlink(asset)
+    asset.use_fake_user = True
 
 
 def _build_instancer_node_group(name, asset, is_collection):
@@ -567,7 +680,26 @@ def instance_blocks_from_manifest(context, manifest_path, report=None, grass_tuf
     if root.name not in context.scene.collection.children:
         context.scene.collection.children.link(root)
 
-    prototypes_dir = os.path.join(os.path.dirname(manifest_path), "prototypes")
+    # Prototypes belonging to *this* export, named after it exactly as the
+    # manifest is. A single shared "prototypes" folder holds whatever the last
+    # export wrote, so importing any earlier one finds only the block states
+    # that later export happened to need -- and every state it lacks falls
+    # back silently to the OBJ's atlas cube. The legacy shared folder is still
+    # accepted so exports made before this change keep working.
+    prototypes_dir = os.path.splitext(manifest_path)[0] + ".prototypes"
+    if prototypes_dir.endswith(".blocks.prototypes"):
+        prototypes_dir = prototypes_dir[: -len(".blocks.prototypes")] + ".prototypes"
+    if not os.path.isdir(prototypes_dir):
+        legacy = os.path.join(os.path.dirname(manifest_path), "prototypes")
+        if os.path.isdir(legacy):
+            prototypes_dir = legacy
+            if report:
+                report(
+                    {'WARNING'},
+                    "Using the shared prototypes folder: it may belong to a "
+                    "different export, so some blocks can fall back to plain "
+                    "cubes. Re-export to get prototypes named for this file.",
+                )
     placed, skipped, failed, from_prototype = {}, [], [], []
     for block_name, variants in manifest.get("blocks", {}).items():
       # One asset that won't load must not cost every later block its swap.
@@ -579,22 +711,64 @@ def instance_blocks_from_manifest(context, manifest_path, report=None, grass_tuf
                 skipped.append(block_name)
                 continue
 
-            # Two-tall plants (tall_grass, peony, lilac, sunflower) occupy two
-            # blocks but the library asset models the whole plant, so placing at
-            # both halves would stack two copies. Keep the lower half only.
+            # A library asset is chosen by block *name*, but some blocks change
+            # shape with their state in ways the library models as separate
+            # assets: a hanging lantern carries a chain, a standing one does
+            # not. Vanilla expresses that as `hanging=true`, and MCprep ships
+            # `lantern_hanging` beside `lantern`. Without this, every hanging
+            # lantern got the standing model -- no chain, and floating below
+            # whatever it should have hung from.
             #
-            # A prototype is built for one *block state*, so variants using
-            # different meshes must become separate instancers: a fence joined
-            # north-south and one joined east-west are not the same shape, and
+            # Where the library has no such variant (there is no
+            # `soul_lantern_hanging`), the name simply will not resolve and the
+            # block falls through to its prototype, which is built from the
+            # vanilla model and so has the chain anyway. That fallback is why
+            # this needs no list of which variants exist.
+            def resolve_for(properties):
+                name = aliases.get(block_name, block_name)
+                if properties.get("hanging") == "true":
+                    hanging = f"{name}_hanging"
+                    if hanging in collections or hanging in objects:
+                        name = hanging
+                    else:
+                        # The library models this block standing only -- MCprep
+                        # ships `lantern_hanging` but no `soul_lantern_hanging`.
+                        # Using the standing asset for a hanging block gives a
+                        # lantern with no chain, floating under whatever it
+                        # should be attached to. The prototype is built from the
+                        # vanilla model for this exact state, so it has the
+                        # chain: correct shape beats a higher-fidelity asset of
+                        # the wrong shape.
+                        return name, False, True
+                coll = name in collections
+                return name, coll, (not coll and name not in objects)
+
+            # Two-tall plants (tall_grass, peony, lilac, sunflower) occupy two
+            # blocks but a *library asset* models the whole plant in one piece,
+            # so placing it at both halves stacks two copies. Keep the lower
+            # half only -- for library assets.
+            #
+            # A prototype is the opposite case: it is built per block state, so
+            # the upper half of a door or a tall plant is a genuinely different
+            # mesh holding the top of that object. Dropping it leaves every
+            # door as its bottom half and every two-tall plant beheaded. The
+            # skip must therefore apply to library assets alone.
+            #
+            # Keying by state also keeps distinct shapes apart: a fence joined
+            # north-south and one joined east-west are not the same mesh, and
             # merging them renders every fence in the world identically. The
             # exporter names each variant's mesh in `prototype`. MCprep assets
             # have no per-state variants, so they stay merged under one key.
             shapes = {}
+            resolutions = {}
             for variant in variants:
-                if variant.get("properties", {}).get("half") == "upper":
+                props = variant.get("properties", {})
+                v_asset, v_is_coll, v_proto = resolve_for(props)
+                if not v_proto and props.get("half") == "upper":
                     continue
-                key = variant.get("prototype", block_name) if use_prototype else block_name
+                key = variant.get("prototype", block_name) if v_proto else v_asset
                 shapes.setdefault(key, []).append(variant)
+                resolutions[key] = (v_asset, v_is_coll, v_proto)
 
             # Resolve the OBJ's own object for this block type *before*
             # appending: the asset may share its name, after which a lookup is
@@ -612,6 +786,7 @@ def instance_blocks_from_manifest(context, manifest_path, report=None, grass_tuf
 
             total_placed = 0
             for shape_key, shape_variants in sorted(shapes.items()):
+                asset_name, is_collection, use_prototype = resolutions[shape_key]
                 # The offset exists to sit an augmenting asset on top of its
                 # block -- a grass tuft above a grass block. A prototype *is*
                 # the block, so lifting it leaves the terrain floating a block
@@ -813,6 +988,16 @@ class IMPORT_OT_project_bedrock(Operator, ImportHelper):
         default=False,
     )
 
+    add_mc_sky: BoolProperty(
+        name="Add MCprep Sky",
+        description=(
+            "Run MCprep's Create MC Sky after importing: a Minecraft sky "
+            "world, sun/moon, and clouds. Skipped silently if MCprep is not "
+            "installed"
+        ),
+        default=True,
+    )
+
     organise_collections: BoolProperty(
         name="Organise into Collections",
         description="Organise imported objects into collections by chunk and block type",
@@ -891,27 +1076,15 @@ class IMPORT_OT_project_bedrock(Operator, ImportHelper):
                 t_mcprep_materials = (time.time() - t0) * 1000.0
 
             wm.progress_update(90)
-            if self.use_mcprep_meshswap and hasattr(bpy.ops.mcprep, 'meshswap'):
-                t0 = time.time()
-                swappable = []
-                for obj in imported_objs:
-                    if obj and obj.name in bpy.data.objects:
-                        name_base = obj.name.split('.')[0].lower()
-                        mat_base = (obj.active_material.name.split('.')[0].lower() if obj.active_material else "")
-                        if name_base in SWAPPABLE_BLOCKS or mat_base in SWAPPABLE_BLOCKS:
-                            swappable.append(obj)
-
-                if swappable:
-                    bpy.ops.object.select_all(action='DESELECT')
-                    for o in swappable:
-                        o.select_set(True)
-                    context.view_layer.objects.active = swappable[0]
-
-                    try:
-                        bpy.ops.mcprep.meshswap('EXEC_DEFAULT')
-                    except Exception as e:
-                        self.report({'WARNING'}, f"MCprep meshswap warning: {e}")
-                t_mcprep_meshswap = (time.time() - t0) * 1000.0
+            # MCprep's own meshswap operator is deliberately not run.
+            #
+            # It swaps whole OBJ objects for library assets, which is the same
+            # job the manifest instancer does in step 5 -- but the instancer
+            # does it better, because the manifest gives it an exact position
+            # and block state per block, where meshswap can only infer from a
+            # merged mesh. Running both placed every swappable block twice,
+            # which is why a single lantern or torch in the save appeared as
+            # two or three in Blender.
 
         # 4. Water colour/transmission override, applied AFTER MCprep so it
         # survives — MCprep's own prep_materials rebuilds each material's
@@ -971,11 +1144,39 @@ class IMPORT_OT_project_bedrock(Operator, ImportHelper):
         # After MCprep and after the prototypes are in, so both the atlas
         # materials and the prototype materials get the authored look.
         shaded_leaves, shaded_water = apply_authored_shaders()
+        untinted = neutralise_mcprep_tint()
         pixelated = set_pixelated_filtering()
         # Runs last so it also catches helpers spawned by MCprep's meshswap,
         # not just those pulled in as append dependencies.
         helpers_hidden = hide_meshswap_helpers()
         t_filtering = (time.time() - t0) * 1000.0
+
+        # 7. MCprep's Minecraft sky: world, sun/moon, clouds. Last, so it
+        # cannot disturb the geometry passes, and only if MCprep is installed
+        # -- the add-on treats MCprep as an optional dependency everywhere else
+        # and this is no different.
+        t0 = time.time()
+        t_sky = 0.0
+        if self.add_mc_sky and hasattr(bpy.ops, 'mcprep') and hasattr(bpy.ops.mcprep, 'add_mc_sky'):
+            # `world_type` is a *dynamic* enum with no default: the shader-based
+            # sky is only offered on Cycles/EEVEE, so asking for it under any
+            # other engine raises. Pick the mesh sky there instead.
+            shader_engines = {'CYCLES', 'BLENDER_EEVEE', 'BLENDER_EEVEE_NEXT'}
+            world_type = (
+                'world_shader'
+                if context.scene.render.engine in shader_engines
+                else 'world_mesh'
+            )
+            try:
+                bpy.ops.mcprep.add_mc_sky(
+                    'EXEC_DEFAULT',
+                    world_type=world_type,
+                    add_clouds=True,
+                    remove_existing_suns=True,
+                )
+            except Exception as e:
+                self.report({'WARNING'}, f"MCprep add_mc_sky warning: {e}")
+            t_sky = (time.time() - t0) * 1000.0
 
         wm.progress_update(100)
         wm.progress_end()
@@ -995,6 +1196,7 @@ class IMPORT_OT_project_bedrock(Operator, ImportHelper):
             f" ({sum(instanced.values())} instances across {len(instanced)} block types)\n"
             f"  - Cleanup:                  {t_filtering:.1f} ms"
             f" ({pixelated} texture node(s) set to Closest)\n"
+            f"  - MCprep Sky:               {t_sky:.1f} ms\n"
             f"  - Objects Processed:        {len(imported_objs)}\n"
             f"=======================================================\n"
         )

@@ -3,7 +3,7 @@
 //! Scanning runs on a background thread so the UI never freezes; thumbnails
 //! are decoded lazily and cached as GPU textures.
 
-use bedrock_parser::detect::{detect_worlds, open_java_world, WorldSummary};
+use bedrock_parser::detect::{detect_worlds, open_bedrock_world, open_java_world, WorldSummary};
 use egui::{Color32, ColorImage, TextureHandle, TextureOptions};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -17,6 +17,13 @@ pub struct WorldBrowserState {
     scan: Option<Receiver<Vec<WorldSummary>>>,
     textures: HashMap<PathBuf, Option<TextureHandle>>,
     selected: Option<usize>,
+    /// Folders added by hand through "Open Folder…".
+    ///
+    /// A finished scan replaces the whole world list, which would silently
+    /// drop anything opened from outside the standard directories -- press
+    /// "Detect Worlds" once and the saves a friend sent you disappear. Kept
+    /// here so they can be put back after every scan.
+    manual_folders: Vec<PathBuf>,
 }
 
 impl WorldBrowserState {
@@ -40,6 +47,7 @@ impl WorldBrowserState {
                 tracing::info!("Detected {} Minecraft world(s)", worlds.len());
                 self.worlds = worlds;
                 self.scan = None;
+                self.restore_manual_worlds();
             }
             Err(TryRecvError::Empty) => ctx.request_repaint(),
             Err(TryRecvError::Disconnected) => {
@@ -52,6 +60,35 @@ impl WorldBrowserState {
     /// The detected worlds (empty until the first scan finishes).
     pub fn worlds(&self) -> &[WorldSummary] {
         &self.worlds
+    }
+
+    /// Re-add hand-opened folders the scan does not know about.
+    ///
+    /// Skips any the scan already found (a folder can be added by hand and
+    /// later moved into the game's own directory) and any that have since
+    /// gone from disk, so the list never grows duplicates or dead entries.
+    fn restore_manual_worlds(&mut self) {
+        for folder in std::mem::take(&mut self.manual_folders) {
+            if self.worlds.iter().any(|w| w.folder == folder) {
+                self.manual_folders.push(folder);
+                continue;
+            }
+            let opened = if folder.join("db").is_dir() {
+                open_bedrock_world(&folder)
+            } else {
+                open_java_world(&folder)
+            };
+            match opened {
+                Ok(summary) => {
+                    self.worlds.push(summary);
+                    self.manual_folders.push(folder);
+                }
+                Err(err) => tracing::warn!(
+                    "Dropping hand-opened world '{}': {err}",
+                    folder.display()
+                ),
+            }
+        }
     }
 
     /// Take the world the user clicked, if any (consumed once).
@@ -69,21 +106,43 @@ impl WorldBrowserState {
     /// but contains world folders (e.g. a `saves` directory), every world
     /// inside is added instead. Returns how many worlds were added.
     pub fn add_manual_world(&mut self, folder: PathBuf) -> Result<usize, String> {
+        // Bedrock first. Both editions ship a `level.dat`, so testing for that
+        // file alone routes every Bedrock world into the Java reader, which
+        // rejects it -- a save a friend sends over is nearly always Bedrock,
+        // and it would report "no level.dat" about a folder that plainly has
+        // one. The `db/` LevelDB folder is what actually distinguishes them.
+        if folder.join("db").is_dir() {
+            self.add_bedrock_world(folder)?;
+            self.selected = Some(self.worlds.len() - 1);
+            return Ok(1);
+        }
         if folder.join("level.dat").is_file() {
             self.add_java_world(folder)?;
             self.selected = Some(self.worlds.len() - 1);
             return Ok(1);
         }
 
-        // Maybe the user picked a `saves` folder — look one level down.
+        // Maybe the user picked a folder *of* worlds -- a `saves` directory,
+        // or the folder a zip of shared saves unpacked into. Take every world
+        // inside, of either edition.
         let mut added = 0;
         if let Ok(entries) = std::fs::read_dir(&folder) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if !path.is_dir() || !path.join("level.dat").is_file() {
+            let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+            // Directory order is filesystem-dependent; sort so the same folder
+            // always yields the same list, and so "open the first" is stable.
+            paths.sort();
+            for path in paths {
+                if !path.is_dir() {
                     continue;
                 }
-                match self.add_java_world(path) {
+                let result = if path.join("db").is_dir() {
+                    self.add_bedrock_world(path)
+                } else if path.join("level.dat").is_file() {
+                    self.add_java_world(path)
+                } else {
+                    continue;
+                };
+                match result {
                     Ok(()) => added += 1,
                     Err(err) => tracing::warn!("Skipping world folder: {err}"),
                 }
@@ -102,15 +161,9 @@ impl WorldBrowserState {
             return Ok(1);
         }
 
-        if folder.join("levelname.txt").is_file() || folder.join("db").is_dir() {
-            return Err(
-                "that looks like a Bedrock Edition world — Bedrock support is not implemented yet"
-                    .to_owned(),
-            );
-        }
         Err(format!(
-            "no level.dat or .mca files found in '{}' — pick a world folder containing \
-             level.dat or region files (.mca)",
+            "no worlds found in '{}' — pick a world folder (Java: level.dat or \
+             region/*.mca; Bedrock: a db/ folder), or a folder containing them",
             folder.display()
         ))
     }
@@ -118,8 +171,24 @@ impl WorldBrowserState {
     /// Read `level.dat` in `folder` and append the world to the list.
     fn add_java_world(&mut self, folder: PathBuf) -> Result<(), String> {
         let summary = open_java_world(&folder)?;
+        self.remember_manual(&summary.folder);
         self.worlds.push(summary);
         Ok(())
+    }
+
+    /// Read a Bedrock world in `folder` and append it to the list.
+    fn add_bedrock_world(&mut self, folder: PathBuf) -> Result<(), String> {
+        let summary = open_bedrock_world(&folder)?;
+        self.remember_manual(&summary.folder);
+        self.worlds.push(summary);
+        Ok(())
+    }
+
+    /// Note a folder as hand-opened so a later scan cannot lose it.
+    fn remember_manual(&mut self, folder: &Path) {
+        if !self.manual_folders.iter().any(|f| f == folder) {
+            self.manual_folders.push(folder.to_path_buf());
+        }
     }
 }
 
@@ -148,7 +217,7 @@ pub fn world_browser(ui: &mut egui::Ui, state: &mut WorldBrowserState) {
                 .clicked()
             {
                 if let Some(folder) = rfd::FileDialog::new()
-                    .set_title("Open a Java Edition world folder")
+                    .set_title("Open a world folder (Java or Bedrock), or a folder of worlds")
                     .pick_folder()
                 {
                     match state.add_manual_world(folder) {

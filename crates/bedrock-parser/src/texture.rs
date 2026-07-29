@@ -411,13 +411,19 @@ fn tint_for(tex_name: &str) -> Option<[u8; 3]> {
         // leaves do. They were listed for the atlas but not here, so blocks
         // taking the prototype path came out colourless while the very same
         // block drawn from the atlas looked right.
-        // `jungle_leaves` is absent on purpose: it ships already coloured, so
-        // tinting it double-darkens the canopy.
+        // `jungle_leaves` belongs here with the rest: it was excluded on the
+        // belief that it ships pre-coloured, but measured against the vanilla
+        // art it averages 0.07 saturation -- grayscale, like `oak_leaves` at
+        // 0.01 and unlike genuinely coloured `cherry_leaves` at 0.72. Left
+        // untinted it renders a grey canopy.
         "oak_leaves" | "acacia_leaves" | "dark_oak_leaves"
         | "mangrove_leaves" | "birch_leaves" | "pale_oak_leaves"
+        | "jungle_leaves"
         | "vine" | "bush" | "leaf_litter" => Some(PLAINS_FOLIAGE),
+        // Spruce is coloured from a *fixed* value in game, not the biome
+        // colormap, so it keeps its own constant.
         "spruce_leaves" => Some([0x61, 0x99, 0x61]),
-        // Cherry leaves ship fully coloured in the JAR — no tint needed.
+        // Cherry and azalea leaves ship fully coloured in the JAR — no tint.
 
         // ── Water plants ─────────────────────────────────────────────────
         // Lily pad is fully green in-game; keep its own tint.

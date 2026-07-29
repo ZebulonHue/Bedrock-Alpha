@@ -1232,10 +1232,23 @@ fn texture_aliases(block: &str) -> Vec<String> {
         _ => {}
     }
 
-    // A slab, stair, wall or fence borrows its parent block's texture.
-    for suffix in ["_slab", "_stairs", "_wall", "_fence"] {
+    // A block cut from another one borrows its texture. `_planks` is included
+    // because the wooden families name their material that way: an
+    // `acacia_pressure_plate` is cut from `acacia_planks`, and stripping the
+    // suffix alone only gets as far as `acacia`, which is not a texture.
+    for suffix in [
+        "_slab",
+        "_stairs",
+        "_wall",
+        "_fence",
+        "_fence_gate",
+        "_pressure_plate",
+        "_button",
+        "_trapdoor",
+    ] {
         if let Some(base) = block.strip_suffix(suffix) {
             out.push(base.to_owned());
+            out.push(format!("{base}_planks"));
             out.push(format!("{base}_block"));
             out.push(format!("{base}s"));
         }
@@ -1342,7 +1355,13 @@ mod tests {
         // `pale_oak_leaves`: grayscale in the client JAR (spread 10/255) but
         // already coloured in this atlas (spread 0.029), so only the prototype
         // path, which uses the JAR, may tint it.
-        const MEASURED_EXCEPTIONS: &[&str] = &["pale_oak_leaves"];
+        //
+        // `jungle_leaves`: the same split. The vanilla PNG measures 0.07 mean
+        // saturation -- grayscale, next to `oak_leaves` at 0.01 and genuinely
+        // coloured `cherry_leaves` at 0.72 -- so the JAR path must tint it or
+        // the canopy renders grey, while this atlas ships the swatch already
+        // coloured and must not.
+        const MEASURED_EXCEPTIONS: &[&str] = &["pale_oak_leaves", "jungle_leaves"];
 
         let mut disagree = Vec::new();
         for name in NAMES {

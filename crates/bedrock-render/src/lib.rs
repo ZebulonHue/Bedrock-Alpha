@@ -62,6 +62,11 @@ pub struct SharedScene {
     pub pending_atlas: Option<mesh::AtlasPixels>,
     /// `(vertices, triangles)` of all chunks currently on the GPU.
     pub mesh_stats: (usize, usize),
+    /// Chunks the last upload could not fit in the GPU geometry budget, and so
+    /// is not drawing. Zero means the loaded world is shown in full. Surfaced
+    /// in the UI because the alternative -- a world that quietly stops partway
+    /// with no indication -- reads as the loader having failed.
+    pub chunks_over_budget: usize,
     /// Desired offscreen size in physical pixels (viewport rect), updated by
     /// the UI each frame. Zero means "hidden".
     pub desired_size: [u32; 2],
@@ -812,13 +817,42 @@ impl ViewportRenderer {
 
     /// Process pending chunk meshes: upsert each chunk's GPU buffers, remove
     /// stale entries, then rebuild the combined vertex/wireframe buffers.
+    ///
+    /// `focus` is the point to keep: when the world's geometry exceeds the GPU
+    /// budget, the chunks nearest it are uploaded and the far ones dropped.
+    /// Returns how many chunks did not fit.
     fn update_chunk_cache(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        meshes: Vec<ChunkMesh>,
+        mut meshes: Vec<ChunkMesh>,
+        focus: [f32; 3],
         build_wireframe: bool,
-    ) {
+    ) -> usize {
+        // Nearest the camera first. The budget below stops at whatever it
+        // reaches, so without an order the chunks that survive are whichever
+        // the mesher happened to emit first -- which is how a world can render
+        // its open ocean in full while the island the camera is pointed at
+        // comes through in pieces.
+        meshes.sort_by(|a, b| {
+            let distance = |m: &ChunkMesh| {
+                let centre = [
+                    (m.bounds_min[0] + m.bounds_max[0]) as f32 * 0.5,
+                    (m.bounds_min[1] + m.bounds_max[1]) as f32 * 0.5,
+                    (m.bounds_min[2] + m.bounds_max[2]) as f32 * 0.5,
+                ];
+                let d = [
+                    centre[0] - focus[0],
+                    centre[1] - focus[1],
+                    centre[2] - focus[2],
+                ];
+                d[0] * d[0] + d[1] * d[1] + d[2] * d[2]
+            };
+            distance(a)
+                .partial_cmp(&distance(b))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
         let mut seen: HashMap<mesh::ChunkId, bool> = HashMap::new();
         // Build combined vertex data + wireframe indices.
         let mut combined_verts: Vec<mesh::Vertex> = Vec::new();
@@ -893,7 +927,9 @@ impl ViewportRenderer {
         }
         if skipped_chunks > 0 {
             tracing::warn!(
-                "GPU geometry budget reached ({} MiB): {} chunk(s) not shown.                  Lower the load radius in Settings to see a smaller area in full.",
+                "GPU geometry budget reached ({} MiB): {} chunk(s) not shown, \
+                 furthest from the camera first. Lower the load radius in \
+                 Settings to see a smaller area in full.",
                 MAX_CHUNK_BYTES / (1024 * 1024),
                 skipped_chunks,
             );
@@ -950,6 +986,8 @@ impl ViewportRenderer {
             queue.write_buffer(wf_buf, 0, bytemuck::cast_slice(&wire_indices));
             self.wireframe_index_count = wire_indices.len() as u32;
         }
+
+        skipped_chunks
     }
 
     /// Extract the six frustum planes from a view-projection matrix.
@@ -1100,12 +1138,16 @@ impl CallbackTrait for ViewportCallback {
         if let Some(meshes) = pending_chunks {
             let verts: usize = meshes.iter().map(|m| m.vertices.len()).sum();
             let tris: usize = meshes.iter().map(|m| m.triangle_count()).sum();
-            renderer.update_chunk_cache(device, queue, meshes, debug.show_wireframe);
-            renderer
-                .shared
-                .lock()
-                .expect("scene lock poisoned")
-                .mesh_stats = (verts, tris);
+            let skipped = renderer.update_chunk_cache(
+                device,
+                queue,
+                meshes,
+                camera.target,
+                debug.show_wireframe,
+            );
+            let mut scene = renderer.shared.lock().expect("scene lock poisoned");
+            scene.mesh_stats = (verts, tris);
+            scene.chunks_over_budget = skipped;
         }
 
         // Upload new atlas if provided.

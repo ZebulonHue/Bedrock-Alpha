@@ -130,11 +130,6 @@ pub struct BedrockApp {
     /// Creeper mark for the current-world row.
     creeper_tex: Option<egui::TextureHandle>,
     overview_tex: Option<egui::TextureHandle>,
-    /// Pixel-art strip along the bottom, in three pieces: the pig end, the
-    /// chicken end, and a tileable stretch of plain grass between them.
-    banner_left: Option<egui::TextureHandle>,
-    banner_mid: Option<egui::TextureHandle>,
-    banner_right: Option<egui::TextureHandle>,
     overview_origin: [i32; 2],
     export_region: ExportRegion,
     export_requested: bool,
@@ -187,9 +182,6 @@ impl BedrockApp {
             background_tex: None,
             creeper_tex: None,
             overview_tex: None,
-            banner_left: None,
-            banner_mid: None,
-            banner_right: None,
             overview_origin: [0; 2],
             export_region: ExportRegion {
                 min: [0; 3],
@@ -786,7 +778,7 @@ impl BedrockApp {
         let ctx = ui.ctx().clone();
         // Linear, not nearest: this is smooth flat-shaded vector-style art
         // (see tools/generate_icon.py), displayed well below its 256px source
-        // size, unlike the pixel-art banner and creeper below it. Nearest
+        // size, unlike the pixel-art creeper below it. Nearest
         // filtering would turn its clean anti-aliased edges jagged.
         let logo = Self::ui_texture(
             &ctx,
@@ -912,78 +904,6 @@ impl BedrockApp {
         response.clicked()
     }
 
-    /// Pixel-art grass strip along the bottom edge.
-    ///
-    /// Composed from three pieces rather than one image. The art is a 6.4:1
-    /// scene, so covering a wide window with it whole means either stretching
-    /// it — which flattens the animals — or repeating it, which gives two pigs
-    /// and two chickens. Instead the pig anchors the left, the chicken anchors
-    /// the right, and a clean stretch of grass tiles between them at the same
-    /// scale, so the strip reads as one continuous field at any width.
-    fn banner(&mut self, ui: &mut egui::Ui) {
-        let ctx = ui.ctx().clone();
-        let left = Self::ui_texture(
-            &ctx,
-            &mut self.banner_left,
-            "ui/banner_left",
-            include_bytes!("../../../assets/ui/banner_left.png"),
-            egui::TextureOptions::NEAREST,
-        );
-        let mid = Self::ui_texture(
-            &ctx,
-            &mut self.banner_mid,
-            "ui/banner_mid",
-            include_bytes!("../../../assets/ui/banner_mid.png"),
-            egui::TextureOptions::NEAREST,
-        );
-        let right = Self::ui_texture(
-            &ctx,
-            &mut self.banner_right,
-            "ui/banner_right",
-            include_bytes!("../../../assets/ui/banner_right.png"),
-            egui::TextureOptions::NEAREST,
-        );
-
-        // One scale for every piece, or the ground line would step between
-        // them. Chosen so the art keeps its own proportions.
-        let art_h = left.size()[1] as f32;
-        let height = 96.0;
-        let scale = height / art_h;
-        let full = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-
-        egui::Panel::bottom("art_banner")
-            .exact_size(height)
-            .frame(egui::Frame::NONE.fill(ui.visuals().panel_fill))
-            .show(ui, |ui| {
-                let rect = ui.max_rect();
-                let painter = ui.painter_at(rect);
-                let draw = |tex: &egui::TextureHandle, x: f32, w: f32| {
-                    painter.image(
-                        tex.id(),
-                        egui::Rect::from_min_size(
-                            egui::pos2(x, rect.bottom() - height),
-                            egui::vec2(w, height),
-                        ),
-                        full,
-                        egui::Color32::WHITE,
-                    );
-                };
-
-                let lw = left.size()[0] as f32 * scale;
-                let rw = right.size()[0] as f32 * scale;
-                let mw = mid.size()[0] as f32 * scale;
-
-                // Grass first, so the animals sit on top of the seams.
-                let mut x = rect.left();
-                while x < rect.right() {
-                    draw(&mid, x, mw.min(rect.right() - x));
-                    x += mw;
-                }
-                draw(&left, rect.left(), lw);
-                draw(&right, rect.right() - rw, rw);
-            });
-    }
-
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         egui::Panel::bottom("status_bar")
             .exact_size(26.0)
@@ -995,10 +915,32 @@ impl BedrockApp {
                         ui.weak(format!("Loading '{loading}'…"));
                     } else if let Some(world) = &self.current_world {
                         ui.weak(format!("World: {world}"));
-                        let stats = self.scene.lock().expect("scene lock poisoned").mesh_stats;
+                        let (stats, over_budget) = {
+                            let scene = self.scene.lock().expect("scene lock poisoned");
+                            (scene.mesh_stats, scene.chunks_over_budget)
+                        };
                         if stats.1 > 0 {
                             ui.separator();
                             ui.weak(format!("{} triangles", human_count(stats.1)));
+                        }
+                        // A partly drawn world otherwise looks like a failed
+                        // load. Say so, and say what to do about it.
+                        if over_budget > 0 {
+                            ui.separator();
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "⚠ {} chunk(s) over GPU budget",
+                                    human_count(over_budget)
+                                ))
+                                .color(egui::Color32::from_rgb(0xE0, 0xA0, 0x30)),
+                            )
+                            .on_hover_text(
+                                "The loaded world needs more GPU memory than the \
+                                 viewport will allocate, so the chunks furthest \
+                                 from the camera are not drawn. Lower the load \
+                                 radius in Settings, or move the camera to bring \
+                                 a different area into the budget.",
+                            );
                         }
                     } else {
                         ui.weak("No world loaded");
@@ -1137,7 +1079,6 @@ impl eframe::App for BedrockApp {
 
         self.menu_bar(ui);
         self.status_bar(ui);
-        self.banner(ui);
 
         self.sidebar(ui);
 
@@ -1238,18 +1179,62 @@ impl eframe::App for BedrockApp {
                         );
                     }
                 }
-                (NavSection::Home, "Map") | (NavSection::Exports, "Region") => {
-                    if section == NavSection::Exports {
-                        bedrock_ui::panels::export_settings(
-                            ui,
-                            &mut self.settings.export,
-                            &mut self.export_region,
-                            self.active_world.is_some(),
-                            &mut self.export_requested,
-                        );
-                        ui.add_space(8.0);
-                    }
+                (NavSection::Home, "Map") => {
                     bedrock_ui::panels::overview(ui, overview, &mut self.export_region);
+                }
+                (NavSection::Exports, "Region") => {
+                    // Settings and map on the left, the 3D view on the right.
+                    // Choosing an export region from coordinate boxes alone is
+                    // working blind: the viewport already draws the selection
+                    // as a box in the world, so the only thing missing was
+                    // having it on screen while the numbers are being typed.
+                    let world_loaded = self.active_world.is_some();
+                    egui::Panel::left("export_tools")
+                        .resizable(true)
+                        .default_size(360.0)
+                        .size_range(300.0..=560.0)
+                        .frame(egui::Frame::NONE.inner_margin(egui::Margin {
+                            right: 12,
+                            ..Default::default()
+                        }))
+                        .show(ui, |ui| {
+                            egui::ScrollArea::vertical()
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    bedrock_ui::panels::export_settings(
+                                        ui,
+                                        &mut self.settings.export,
+                                        &mut self.export_region,
+                                        world_loaded,
+                                        &mut self.export_requested,
+                                    );
+                                    ui.add_space(8.0);
+                                    bedrock_ui::panels::overview(
+                                        ui,
+                                        overview,
+                                        &mut self.export_region,
+                                    );
+                                });
+                        });
+                    if world_loaded {
+                        bedrock_ui::panels::viewport(ui, &self.scene);
+                    } else {
+                        // Same reason as Home > Explore: with no world the 3D
+                        // paint callback is an opaque rectangle over the
+                        // background, so skip it rather than draw a black box.
+                        ui.allocate_space(ui.available_size());
+                        ui.put(
+                            egui::Rect::from_center_size(
+                                ui.max_rect().center(),
+                                egui::vec2(320.0, 40.0),
+                            ),
+                            egui::Label::new(
+                                egui::RichText::new("Open a world to see the area you are exporting")
+                                    .color(bedrock_ui::theme::MUTED)
+                                    .size(14.0),
+                            ),
+                        );
+                    }
                 }
                 (NavSection::Home, "Details") => bedrock_ui::panels::properties(ui),
                 (NavSection::Worlds, _) => {

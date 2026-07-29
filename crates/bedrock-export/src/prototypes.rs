@@ -34,8 +34,8 @@ pub struct PrototypeStats {
     pub skipped: Vec<String>,
 }
 
-/// Write `prototypes/<block>.obj` + `.mtl` and `prototypes/textures/*.png`
-/// for every block id in `blocks`.
+/// Write `<export>.prototypes/<block>.obj` + `.mtl` and
+/// `<export>.prototypes/textures/*.png` for every block id in `blocks`.
 ///
 /// Geometry comes from the same per-block model data the main exporter uses,
 /// evaluated at the origin with nothing adjacent, so every face is present —
@@ -52,10 +52,17 @@ pub fn write_block_prototypes(
 ) -> PrototypeStats {
     let mut stats = PrototypeStats::default();
 
-    let dir = match obj_path.parent() {
-        Some(parent) => parent.join("prototypes"),
-        None => return stats,
-    };
+    // Named after the OBJ, exactly like the `blocks.json` beside it, and for
+    // the same reason: one shared `prototypes/` folder holds whichever export
+    // wrote last, so importing an older export finds only the stems the newer
+    // one happened to need. Every block state missing from that set silently
+    // falls back to the OBJ's atlas cube -- which is how a bed, a bell and a
+    // conduit end up as featureless boxes while a bed of another colour, from
+    // the export that did run last, comes through correctly.
+    let dir = obj_path.with_extension("prototypes");
+    if dir.parent().is_none() {
+        return stats;
+    }
     let texture_dir = dir.join("textures");
     if std::fs::create_dir_all(&texture_dir).is_err() {
         tracing::warn!("could not create {}", texture_dir.display());
