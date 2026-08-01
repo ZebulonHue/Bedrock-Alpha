@@ -483,6 +483,33 @@ def _append_meshswap_asset(blend_path, name, is_collection):
     return chosen
 
 
+def _load_atlas_image(path):
+    """Load the export's atlas, refreshing it if Blender already had one.
+
+    `check_existing=True` matches on filepath and hands back the datablock
+    already in the file -- *without* re-reading it from disk. Re-exporting a
+    world writes a new atlas to the same path, and the number of rows changes
+    whenever a different set of blocks needs filling in from the client JAR.
+    Blender would then keep the old pixels and, worse, the old height.
+
+    That silently corrupts every UV, because they are fractions of the atlas
+    height: a 1264-row atlas read as 1280 shifts each lookup by 1.25% of the
+    way down the image. Blocks near the top are unaffected, which is why stone
+    always looked right, while a block far down like cherry_leaves lands
+    most of a tile away and shows a completely different texture. The symptom
+    reads as "the exporter got the texture wrong" when the export is correct
+    and only Blender's copy is stale.
+    """
+    image = bpy.data.images.load(path, check_existing=True)
+    # Cheap and unconditional: `reload` re-reads the file and updates the
+    # cached size, which is the part that has to be right.
+    try:
+        image.reload()
+    except Exception:
+        pass
+    return image
+
+
 def _centre_collection_for_instancing(collection):
     """Move a collection's instancing origin onto its own contents.
 
@@ -1524,7 +1551,7 @@ class IMPORT_OT_project_bedrock(Operator, ImportHelper):
         tex_image.interpolation = 'Closest'
 
         if atlas_path and os.path.isfile(atlas_path) and not tex_image.image:
-            tex_image.image = bpy.data.images.load(atlas_path, check_existing=True)
+            tex_image.image = _load_atlas_image(atlas_path)
 
         if hasattr(tex_image, 'mnp'):
             try:
