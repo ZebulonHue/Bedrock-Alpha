@@ -77,6 +77,16 @@ pub struct BlockQuad {
     pub normal: [i32; 3],
     /// Optional override texture name (None = use face-based UV from block).
     pub texture: Option<String>,
+    /// The model's own UV rectangle for this face, `[x1, y1, x2, y2]` in
+    /// vanilla's 0..16 pixel space with y measured from the top of the image.
+    ///
+    /// Carried through because it is not always the whole texture, and not
+    /// always the right way round: vanilla mirrors a right-hinged door by
+    /// reversing this rectangle rather than by moving any geometry. Deriving
+    /// UVs from vertex positions alone therefore cannot tell the two hinges
+    /// apart, and every door came out with its handle on the same side.
+    /// `None` for plain cube faces, which use the whole texture.
+    pub uv: Option<[f32; 4]>,
 }
 
 /// Get the quads for a block.  All blocks are full cubes; visible faces
@@ -158,6 +168,7 @@ pub fn block_quads_stated<'a>(
             face_idx,
             normal: *normal,
             texture: None,
+            uv: None,
         });
     }
     quads
@@ -190,6 +201,20 @@ pub fn face_uv_corners(quad: &BlockQuad) -> [[f32; 2]; 4] {
         let u = if u == 0.0 && corner[ua] > 0.0 { 1.0 } else { u };
         let v = if v == 0.0 && corner[va] > 0.0 { 1.0 } else { v };
         *slot = [u, if flip_v { 1.0 - v } else { v }];
+    }
+
+    // Remap into the model's own rectangle when it declares one. Because the
+    // rectangle is applied as a straight interpolation, a reversed one (x1 >
+    // x2) mirrors the texture for free, which is exactly how vanilla flips a
+    // right-hinged door -- and it also handles faces that use only part of
+    // their image rather than all of it.
+    if let Some([x1, y1, x2, y2]) = quad.uv {
+        let (u1, u2) = (x1 / 16.0, x2 / 16.0);
+        let (v1, v2) = (y1 / 16.0, y2 / 16.0);
+        for slot in out.iter_mut() {
+            slot[0] = u1 + slot[0] * (u2 - u1);
+            slot[1] = v1 + slot[1] * (v2 - v1);
+        }
     }
     out
 }
@@ -303,6 +328,7 @@ fn model_quads<'a>(
                     normal_dir[2].round() as i32,
                 ],
                 texture: Some(face.texture.to_owned()),
+                uv: Some(face.uv),
             });
         }
     }

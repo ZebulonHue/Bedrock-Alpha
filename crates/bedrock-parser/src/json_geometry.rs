@@ -237,6 +237,10 @@ pub fn generate_quads_from_elements<'a>(
                     face_idx,
                     normal: rotated_normal,
                     texture: Some(tex),
+                    // This path builds quads from raw JSON at runtime and does
+                    // not track per-face UV rectangles, so the whole texture is
+                    // used -- the same behaviour it had before the field existed.
+                    uv: None,
                 });
             }
         }
