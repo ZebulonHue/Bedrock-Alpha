@@ -194,6 +194,43 @@ pub fn face_uv_corners(quad: &BlockQuad) -> [[f32; 2]; 4] {
     // Side faces run bottom-up in world space but top-down in texture space.
     let flip_v = normal[1] == 0;
     let mut out = [[0.0f32; 2]; 4];
+
+    if let Some([x1, y1, x2, y2]) = quad.uv {
+        // The model states this face's rectangle outright, so the coordinates
+        // are that rectangle spread across the face -- *not* the face's
+        // position within the block. Those are different things whenever a box
+        // is smaller than a full block: a stair's bottom slab spans y 0..8 and
+        // declares uv [0, 8, 16, 16], meaning "the lower half of the image
+        // stretched over me". Deriving from position and then remapping into
+        // the rectangle applies that halving twice and shows a quarter of the
+        // texture instead.
+        //
+        // Interpolating the rectangle across the face also mirrors for free
+        // when it is reversed (x1 > x2), which is how vanilla flips a
+        // right-hinged door.
+        let span = |axis: usize| {
+            let vals = quad.corners.iter().map(|c| c[axis] as f32);
+            let lo = vals.clone().fold(f32::INFINITY, f32::min);
+            let hi = vals.fold(f32::NEG_INFINITY, f32::max);
+            (lo, hi - lo)
+        };
+        let (u_lo, u_len) = span(ua);
+        let (v_lo, v_len) = span(va);
+        let (ru1, ru2) = (x1 / 16.0, x2 / 16.0);
+        let (rv1, rv2) = (y1 / 16.0, y2 / 16.0);
+
+        for (slot, corner) in out.iter_mut().zip(quad.corners.iter()) {
+            // Where this corner sits across the face itself, 0..1. A
+            // degenerate span (a face seen edge-on) collapses to 0 rather
+            // than dividing by zero.
+            let s = if u_len > 1e-6 { (corner[ua] as f32 - u_lo) / u_len } else { 0.0 };
+            let t = if v_len > 1e-6 { (corner[va] as f32 - v_lo) / v_len } else { 0.0 };
+            let t = if flip_v { 1.0 - t } else { t };
+            *slot = [ru1 + s * (ru2 - ru1), rv1 + t * (rv2 - rv1)];
+        }
+        return out;
+    }
+
     for (slot, corner) in out.iter_mut().zip(quad.corners.iter()) {
         let u = corner[ua].rem_euclid(1.0) as f32;
         let v = corner[va].rem_euclid(1.0) as f32;
@@ -201,20 +238,6 @@ pub fn face_uv_corners(quad: &BlockQuad) -> [[f32; 2]; 4] {
         let u = if u == 0.0 && corner[ua] > 0.0 { 1.0 } else { u };
         let v = if v == 0.0 && corner[va] > 0.0 { 1.0 } else { v };
         *slot = [u, if flip_v { 1.0 - v } else { v }];
-    }
-
-    // Remap into the model's own rectangle when it declares one. Because the
-    // rectangle is applied as a straight interpolation, a reversed one (x1 >
-    // x2) mirrors the texture for free, which is exactly how vanilla flips a
-    // right-hinged door -- and it also handles faces that use only part of
-    // their image rather than all of it.
-    if let Some([x1, y1, x2, y2]) = quad.uv {
-        let (u1, u2) = (x1 / 16.0, x2 / 16.0);
-        let (v1, v2) = (y1 / 16.0, y2 / 16.0);
-        for slot in out.iter_mut() {
-            slot[0] = u1 + slot[0] * (u2 - u1);
-            slot[1] = v1 + slot[1] * (v2 - v1);
-        }
     }
     out
 }

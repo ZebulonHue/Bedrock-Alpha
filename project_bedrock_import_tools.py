@@ -20,6 +20,7 @@ import bpy
 import os
 import json
 import math
+import re
 from bpy_extras.io_utils import ImportHelper
 from bpy.types import Operator
 from bpy.props import StringProperty, BoolProperty, EnumProperty
@@ -353,6 +354,11 @@ def set_pixelated_filtering():
                 node.interpolation = 'Closest'
                 changed += 1
     return changed
+
+# Blocks whose id marks them as fixed to the side of a neighbour rather than
+# standing in their own cell. Vanilla is consistent about this naming, so
+# matching on it beats maintaining a hand list that silently misses blocks.
+_WALL_MOUNTED_RE = re.compile(r"(^|_)wall_(torch|sign|banner|skull|head|fan|hanging_sign)$")
 
 MESHSWAP_ALIASES = {
     "grass": "short_grass",
@@ -752,6 +758,18 @@ def instance_blocks_from_manifest(context, manifest_path, report=None, grass_tuf
             # vanilla model and so has the chain anyway. That fallback is why
             # this needs no list of which variants exist.
             def resolve_for(properties):
+                # Vanilla gives wall-mounted blocks their own id ("wall_torch",
+                # "oak_wall_sign", "skeleton_wall_skull") whose model sits
+                # against the neighbouring block and, for torches, leans away
+                # from it. The library only ships the free-standing form, so
+                # aliasing to it drops the block at the centre of its own cell,
+                # upright and detached -- a torch hovering in the room rather
+                # than fixed to the wall. Same trade as `hanging` below: the
+                # prototype carries the real state's geometry, so take it.
+                if _WALL_MOUNTED_RE.search(block_name):
+                    wall_asset = block_name in collections or block_name in objects
+                    if not wall_asset:
+                        return block_name, False, True
                 name = aliases.get(block_name, block_name)
                 if properties.get("hanging") == "true":
                     hanging = f"{name}_hanging"
