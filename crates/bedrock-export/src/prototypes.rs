@@ -78,6 +78,8 @@ pub fn write_block_prototypes(
     };
 
     let mut extracted: BTreeSet<String> = BTreeSet::new();
+    let mut animations: BTreeMap<String, bedrock_parser::texture_animation::TextureAnimation> =
+        BTreeMap::new();
 
     for (stem, (block, properties)) in blocks {
         // No neighbours: every face of the prototype must be drawn.
@@ -132,7 +134,13 @@ pub fn write_block_prototypes(
         let mut materials: Vec<(String, bool)> = Vec::new();
 
         for (texture, group) in &by_texture {
-            let cutout = extract_texture(&loader, texture, &texture_dir, &mut extracted);
+            let cutout = extract_texture(
+                &loader,
+                texture,
+                &texture_dir,
+                &mut extracted,
+                &mut animations,
+            );
             materials.push((texture.clone(), cutout));
 
             let _ = writeln!(obj, "o {stem}_{texture}");
@@ -209,6 +217,29 @@ pub fn write_block_prototypes(
     }
 
     stats.textures = extracted.len();
+
+    // Every animated texture the JAR ships, not just the ones these prototypes
+    // reference. The library's assets carry their own copies of the vanilla
+    // textures -- the torch flame, fire, lava -- and they are named after the
+    // same ones, so a full table is what lets the addon animate those too.
+    for name in loader.meta_names() {
+        if animations.contains_key(name) {
+            continue;
+        }
+        let Some(png) = loader.get(name) else { continue };
+        if let Some(anim) = read_animation(&loader, name, png) {
+            animations.insert(name.to_owned(), anim);
+        }
+    }
+
+    // One sidecar for the whole export rather than one per texture: the addon
+    // reads it once and looks every image up, including the library's own
+    // assets, which are named after the same vanilla textures.
+    if let Ok(json) = serde_json::to_string_pretty(&animations) {
+        let _ = std::fs::write(texture_dir.join("animations.json"), json);
+    }
+    tracing::info!("{} animated prototype textures", animations.len());
+
     stats
 }
 
@@ -270,6 +301,7 @@ fn extract_texture(
     name: &str,
     dir: &Path,
     seen: &mut BTreeSet<String>,
+    animations: &mut BTreeMap<String, bedrock_parser::texture_animation::TextureAnimation>,
 ) -> bool {
     // Track the name the texture was actually found under. A block whose model
     // has no explicit texture asks for its own id -- `water` -- and resolves
@@ -288,9 +320,13 @@ fn extract_texture(
         return false;
     };
 
-    // Animated textures ship as a vertical strip of square frames. Written out
-    // whole, a face's 0..1 V range covers every frame at once.
-    let png = first_animation_frame(&png).unwrap_or(png);
+    // Animated textures ship as a vertical strip of square frames, and the
+    // whole strip goes out: a face's 0..1 V range then covers every frame at
+    // once, which the addon narrows to one row and keys over time. Cropping to
+    // frame 1 here is what used to leave fire, magma and portals frozen.
+    if let Some(anim) = read_animation(loader, &resolved, &png) {
+        animations.insert(name.to_owned(), anim);
+    }
 
     if seen.insert(name.to_owned()) {
         let tint = bedrock_parser::texture::biome_tint(&resolved)
@@ -304,24 +340,21 @@ fn extract_texture(
     has_alpha(&png)
 }
 
-/// Crop an animation strip down to its first frame, or `None` if it is a
-/// plain square texture.
+/// Read a texture's animation, if it has one.
 ///
-/// Minecraft stacks animation frames vertically in one PNG — `water_still` is
-/// 16 wide and 512 tall, 32 frames — and describes the timing in a sidecar
-/// `.mcmeta`. A static mesh wants one frame.
-fn first_animation_frame(png: &[u8]) -> Option<Vec<u8>> {
+/// Both halves are needed: the sidecar names the order and timing, the PNG
+/// says how many rows the strip actually has. A sidecar without a matching
+/// strip (or the other way round) is not an animation.
+fn read_animation(
+    loader: &JarTextureLoader,
+    resolved: &str,
+    png: &[u8],
+) -> Option<bedrock_parser::texture_animation::TextureAnimation> {
+    let mcmeta = loader.meta(resolved)?;
     let image = image::load_from_memory(png).ok()?;
-    let (width, height) = (image.width(), image.height());
-    if height <= width || width == 0 || height % width != 0 {
-        return None;
-    }
-    let frame = image.crop_imm(0, 0, width, width);
-    let mut out = Vec::new();
-    frame
-        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
-        .ok()?;
-    Some(out)
+    let frames =
+        bedrock_parser::texture_animation::strip_frame_count(image.width(), image.height())?;
+    bedrock_parser::texture_animation::parse_mcmeta(mcmeta, frames)
 }
 
 /// Multiply a PNG's RGB by `tint`, leaving alpha alone, and re-encode it.

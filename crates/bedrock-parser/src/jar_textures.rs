@@ -22,6 +22,12 @@ const BLOCK_PREFIX: &str = "assets/minecraft/textures/block/";
 pub struct JarTextureLoader {
     /// Raw PNG bytes per texture name.
     textures: HashMap<String, Vec<u8>>,
+    /// Raw `.png.mcmeta` bytes per texture name, for the animated ones.
+    ///
+    /// A texture is animated only if it ships one of these; the strip's shape
+    /// alone does not say so, and guessing from the aspect ratio would rig
+    /// perfectly static tall textures as flipbooks.
+    meta: HashMap<String, Vec<u8>>,
     /// Which Minecraft version the textures came from (informational).
     pub version: String,
 }
@@ -32,6 +38,7 @@ impl JarTextureLoader {
     pub fn empty() -> Self {
         Self {
             textures: HashMap::new(),
+            meta: HashMap::new(),
             version: "none".to_owned(),
         }
     }
@@ -100,20 +107,28 @@ impl JarTextureLoader {
             zip::ZipArchive::new(file).map_err(|e| format!("Cannot read JAR as ZIP: {e}"))?;
 
         let mut textures: HashMap<String, Vec<u8>> = HashMap::new();
+        let mut meta: HashMap<String, Vec<u8>> = HashMap::new();
 
         for i in 0..archive.len() {
             let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
             let name = entry.name().to_owned();
-            if !name.starts_with(BLOCK_PREFIX) || !name.ends_with(".png") {
+            if !name.starts_with(BLOCK_PREFIX) {
                 continue;
             }
-            // Strip prefix and .png suffix to get the texture name.
-            let texture_name = &name[BLOCK_PREFIX.len()..name.len() - 4];
+            let (target, suffix) = if name.ends_with(".png") {
+                (&mut textures, ".png")
+            } else if name.ends_with(".png.mcmeta") {
+                (&mut meta, ".png.mcmeta")
+            } else {
+                continue;
+            };
+            // Strip prefix and suffix to get the texture name.
+            let texture_name = &name[BLOCK_PREFIX.len()..name.len() - suffix.len()];
             let mut bytes = Vec::with_capacity(entry.size() as usize);
             entry
                 .read_to_end(&mut bytes)
                 .map_err(|e| format!("Cannot read texture {name}: {e}"))?;
-            textures.insert(texture_name.to_owned(), bytes);
+            target.insert(texture_name.to_owned(), bytes);
         }
 
         if textures.is_empty() {
@@ -122,7 +137,11 @@ impl JarTextureLoader {
                 jar_path.display()
             ));
         }
-        Ok(Self { textures, version })
+        Ok(Self {
+            textures,
+            meta,
+            version,
+        })
     }
 
     /// Raw PNG bytes for a texture name, e.g. `"grass_block_top"`.
@@ -142,6 +161,18 @@ impl JarTextureLoader {
             _ => return None,
         };
         self.textures.get(alias).map(Vec::as_slice)
+    }
+
+    /// Raw `.png.mcmeta` bytes for a texture, if it ships one.
+    pub fn meta(&self, name: &str) -> Option<&[u8]> {
+        self.meta.get(name).map(Vec::as_slice)
+    }
+
+    /// Every texture name that ships an `.mcmeta`, sorted.
+    pub fn meta_names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self.meta.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        names
     }
 
     /// First texture (by name order) whose name starts with `prefix`.

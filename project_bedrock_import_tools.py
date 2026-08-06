@@ -324,6 +324,185 @@ def neutralise_mcprep_tint():
     return fixed
 
 
+# Minecraft runs at 20 ticks a second, and every animation duration in a
+# .mcmeta sidecar is quoted in those ticks.
+TICKS_PER_SECOND = 20.0
+
+# Name given to the mapping node this add-on inserts, so a re-import can spot
+# its own work instead of stacking a second rig on top of the first.
+ANIM_NODE = "PB_TextureAnimation"
+
+
+def prototypes_dir_for(export_path):
+    """The `.prototypes` folder belonging to one export, by its OBJ/manifest path.
+
+    Named after the export rather than shared, so importing an older export
+    cannot pick up whatever the last one happened to write.
+    """
+    directory = os.path.splitext(export_path)[0] + ".prototypes"
+    if directory.endswith(".blocks.prototypes"):
+        directory = directory[: -len(".blocks.prototypes")] + ".prototypes"
+    if os.path.isdir(directory):
+        return directory
+    legacy = os.path.join(os.path.dirname(export_path), "prototypes")
+    return legacy if os.path.isdir(legacy) else directory
+
+
+def load_animation_table(texture_dir):
+    """Read the exporter's `animations.json`, keyed by texture name.
+
+    Only textures the game itself declares animated appear here. That matters:
+    a strip's shape alone does not mean it is a flipbook, and rigging a tall
+    static texture as one would scramble it.
+    """
+    path = os.path.join(texture_dir, "animations.json")
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError) as err:
+        print(f"[Project Bedrock] could not read {path}: {err}")
+        return {}
+
+
+def _texture_stem(image):
+    """The vanilla texture name behind an image datablock, or None.
+
+    Blender suffixes duplicates (`fire_1.png.001`) and the library's own assets
+    arrive with the file extension still attached, so both have to come off
+    before the name will match the table.
+    """
+    name = os.path.basename(image.filepath) or image.name
+    name = re.sub(r"\.\d{3}$", "", name)
+    return os.path.splitext(name)[0] or None
+
+
+def _animated_fcurves(node_tree):
+    """The F-curves driving a node tree, across both action APIs.
+
+    Blender 4.4 moved keyframes off `Action.fcurves` and into slotted actions,
+    and 5.x dropped the old attribute entirely, so reaching them now goes
+    through the channelbag for whichever slot is assigned.
+    """
+    adt = node_tree.animation_data
+    if adt is None or adt.action is None:
+        return None
+    legacy = getattr(adt.action, "fcurves", None)
+    if legacy is not None:
+        return legacy
+    try:
+        from bpy_extras import anim_utils
+    except ImportError:
+        return None
+    bag = anim_utils.animdata_get_channelbag_for_assigned_slot(adt)
+    return bag.fcurves if bag else None
+
+
+def animate_texture_node(node_tree, node, anim, fps):
+    """Key one image node's UVs to step through its animation strip.
+
+    The whole strip is one image, so the face's 0..1 V range covers every
+    frame at once. Scaling V by 1/frames narrows it to a single row and the
+    offset picks which -- row 0 sits at the *top* of the image, where Blender
+    measures V from the bottom, hence the inversion.
+
+    Timing is keyed rather than driven because a sidecar may hold individual
+    frames longer than the rest (magma and prismarine both do), which no single
+    rate expression covers. Constant interpolation keeps frames snapping over
+    rather than sliding, and a cycles modifier loops without keying every
+    repeat.
+    """
+    frames = anim["frame_count"]
+    steps = anim["steps"]
+    if frames < 2 or not steps:
+        return False
+
+    mapping = node_tree.nodes.get(ANIM_NODE)
+    if mapping is None:
+        mapping = node_tree.nodes.new("ShaderNodeMapping")
+        mapping.name = ANIM_NODE
+        mapping.label = "Texture Animation"
+        mapping.location = (node.location.x - 320, node.location.y)
+        uv = node_tree.nodes.new("ShaderNodeUVMap")
+        uv.location = (mapping.location.x - 200, mapping.location.y)
+        node_tree.links.new(mapping.inputs["Vector"], uv.outputs["UV"])
+        node_tree.links.new(node.inputs["Vector"], mapping.outputs["Vector"])
+
+    mapping.inputs["Scale"].default_value = (1.0, 1.0 / frames, 1.0)
+
+    # Location is input index 1; its Y component is the row selector.
+    path = f'nodes["{mapping.name}"].inputs[1].default_value'
+    existing = _animated_fcurves(node_tree)
+    if existing is not None:
+        for curve in [c for c in existing if c.data_path == path]:
+            existing.remove(curve)
+
+    # A cycles modifier repeats the span between the first and last key, so a
+    # key per step would cut the final one to zero length -- the last frame of
+    # every animation would simply never be shown. Repeating the opening value
+    # at the end of the loop gives that step its full duration.
+    tick = 0
+    keys = []
+    for step in steps:
+        keys.append((tick, (frames - 1 - step["index"]) / frames))
+        tick += step["ticks"]
+    keys.append((tick, keys[0][1]))
+
+    for tick, offset in keys:
+        # Scene frame 1 is the start of the loop, hence the +1.
+        mapping.inputs["Location"].default_value[1] = offset
+        mapping.inputs["Location"].keyframe_insert(
+            "default_value", index=1, frame=1 + tick * fps / TICKS_PER_SECOND
+        )
+
+    curves = _animated_fcurves(node_tree)
+    if curves is None:
+        return False
+    for curve in curves:
+        if curve.data_path != path:
+            continue
+        for key in curve.keyframe_points:
+            key.interpolation = 'CONSTANT'
+        if not any(m.type == 'CYCLES' for m in curve.modifiers):
+            curve.modifiers.new('CYCLES')
+    return True
+
+
+def apply_texture_animations(texture_dir, fps):
+    """Rig every animated texture in the file, prototypes and library alike.
+
+    The library's assets are named after the same vanilla textures, so one
+    table covers both -- which is what makes fire, lava, portals and the torch
+    flame move rather than sitting on frame one.
+
+    Returns the number of texture nodes rigged.
+    """
+    table = load_animation_table(texture_dir)
+    if not table:
+        return 0
+
+    rigged = 0
+    trees = [m.node_tree for m in bpy.data.materials if m.use_nodes and m.node_tree]
+    trees += list(bpy.data.node_groups)
+    for tree in trees:
+        for node in list(tree.nodes):
+            if node.type != 'TEX_IMAGE' or node.image is None:
+                continue
+            anim = table.get(_texture_stem(node.image))
+            if anim is None:
+                continue
+            # The table describes the full strip. An image that is not that
+            # shape is a single frame someone already split out, and moving
+            # its UVs would only slide it off the texture.
+            width, height = node.image.size
+            if width <= 0 or height != width * anim["frame_count"]:
+                continue
+            if animate_texture_node(tree, node, anim, fps):
+                rigged += 1
+    return rigged
+
+
 def set_pixelated_filtering():
     """Force nearest-neighbour sampling on every image texture in the file.
 
@@ -1191,6 +1370,12 @@ class IMPORT_OT_project_bedrock(Operator, ImportHelper):
         shaded_leaves, shaded_water = apply_authored_shaders()
         untinted = neutralise_mcprep_tint()
         pixelated = set_pixelated_filtering()
+        # After MCprep for the same reason as the filtering above -- a node
+        # graph it rebuilds takes the animation rig with it.
+        animated = apply_texture_animations(
+            os.path.join(prototypes_dir_for(self.filepath), "textures"),
+            context.scene.render.fps,
+        )
         # Runs last so it also catches helpers spawned by MCprep's meshswap,
         # not just those pulled in as append dependencies.
         helpers_hidden = hide_meshswap_helpers()

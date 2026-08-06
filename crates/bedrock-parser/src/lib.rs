@@ -40,4 +40,5 @@ pub mod mineways_data;
 pub mod nbt_le;
 pub mod region;
 pub mod texture;
+pub mod texture_animation;
 pub mod world;
