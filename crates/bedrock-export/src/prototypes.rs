@@ -166,9 +166,20 @@ pub fn write_block_prototypes(
                 }
                 // The prototype's texture is the block's own PNG, so each face
                 // spans the whole image rather than a slice of an atlas.
+                //
+                // An animated one is a strip of frames, though, and a face
+                // that spans the whole image would show all of them stacked
+                // at once. Narrow it to the first frame here, in the mesh, so
+                // the OBJ is right on its own -- opened in anything, with the
+                // add-on's animation pass disabled, or if that pass fails. The
+                // animation then only slides this window down the strip.
                 let uvs = block_shape::face_uv_corners(quad);
+                let frames = animations.get(texture).map_or(1, |a| a.frame_count);
                 for uv in &uvs {
-                    let _ = writeln!(obj, "vt {:.4} {:.4}", uv[0], 1.0 - uv[1]);
+                    let v = 1.0 - uv[1];
+                    let v = (v + f32::from(u16::try_from(frames - 1).unwrap_or(0)))
+                        / frames as f32;
+                    let _ = writeln!(obj, "vt {:.4} {v:.4}", uv[0]);
                 }
                 let _ = writeln!(
                     obj,

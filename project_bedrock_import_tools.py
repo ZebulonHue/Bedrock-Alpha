@@ -402,10 +402,11 @@ def _animated_fcurves(node_tree):
 def animate_texture_node(node_tree, node, anim, fps):
     """Key one image node's UVs to step through its animation strip.
 
-    The whole strip is one image, so the face's 0..1 V range covers every
-    frame at once. Scaling V by 1/frames narrows it to a single row and the
-    offset picks which -- row 0 sits at the *top* of the image, where Blender
-    measures V from the bottom, hence the inversion.
+    The exporter already narrowed each face's UVs to the strip's first frame,
+    so the mesh reads correctly with this pass switched off or absent. All
+    that is left here is sliding that window down the strip: one frame is
+    1/frames of the image, and row 0 sits at the top, so later rows are
+    reached by moving V *down*.
 
     Timing is keyed rather than driven because a sidecar may hold individual
     frames longer than the rest (magma and prismarine both do), which no single
@@ -442,7 +443,9 @@ def animate_texture_node(node_tree, node, anim, fps):
             node_tree.links.new(mapping.inputs["Vector"], uv.outputs["UV"])
         node_tree.links.new(node.inputs["Vector"], mapping.outputs["Vector"])
 
-    mapping.inputs["Scale"].default_value = (1.0, 1.0 / frames, 1.0)
+    # Scale stays at 1: the window is already the right size, cut into the
+    # UVs themselves. Scaling here as well would narrow it a second time.
+    mapping.inputs["Scale"].default_value = (1.0, 1.0, 1.0)
 
     # Location is input index 1; its Y component is the row selector.
     path = f'nodes["{mapping.name}"].inputs[1].default_value'
@@ -458,7 +461,7 @@ def animate_texture_node(node_tree, node, anim, fps):
     tick = 0
     keys = []
     for step in steps:
-        keys.append((tick, (frames - 1 - step["index"]) / frames))
+        keys.append((tick, -step["index"] / frames))
         tick += step["ticks"]
     keys.append((tick, keys[0][1]))
 
