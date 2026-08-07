@@ -418,15 +418,28 @@ def animate_texture_node(node_tree, node, anim, fps):
     if frames < 2 or not steps:
         return False
 
-    mapping = node_tree.nodes.get(ANIM_NODE)
+    # One mapping node per image node, not per material: a material can hold
+    # two animated textures, and sharing a node would make the second one's
+    # keys fight the first's over the same offset.
+    name = f"{ANIM_NODE}_{node.name}"
+    mapping = node_tree.nodes.get(name)
     if mapping is None:
         mapping = node_tree.nodes.new("ShaderNodeMapping")
-        mapping.name = ANIM_NODE
+        mapping.name = name
         mapping.label = "Texture Animation"
         mapping.location = (node.location.x - 320, node.location.y)
-        uv = node_tree.nodes.new("ShaderNodeUVMap")
-        uv.location = (mapping.location.x - 200, mapping.location.y)
-        node_tree.links.new(mapping.inputs["Vector"], uv.outputs["UV"])
+
+        # Splice in front of whatever already drives the UVs rather than
+        # replacing it. An input socket takes a single link, so linking
+        # straight to the image node would silently drop the library's own
+        # mapping -- and those materials are exactly the ones this now runs on.
+        existing = node.inputs["Vector"].links
+        if existing:
+            node_tree.links.new(mapping.inputs["Vector"], existing[0].from_socket)
+        else:
+            uv = node_tree.nodes.new("ShaderNodeUVMap")
+            uv.location = (mapping.location.x - 200, mapping.location.y)
+            node_tree.links.new(mapping.inputs["Vector"], uv.outputs["UV"])
         node_tree.links.new(node.inputs["Vector"], mapping.outputs["Vector"])
 
     mapping.inputs["Scale"].default_value = (1.0, 1.0 / frames, 1.0)
