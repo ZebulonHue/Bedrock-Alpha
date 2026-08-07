@@ -107,6 +107,21 @@ pub fn block_quads<'a>(
 /// per-side connection flags. Without them every stair in a build points the
 /// same way and fences lose their rails, so callers that have the state
 /// should pass it.
+/// How far to turn a code-drawn block about Y for its `facing`.
+///
+/// The renderers take the facing from the block state and rotate the model
+/// themselves, so the transcribed boxes are all in the default orientation and
+/// the turn has to be applied here. Blocks without a facing return 0, which
+/// leaves them alone.
+fn block_entity_rotation(properties: &HashMap<String, String>) -> f32 {
+    match properties.get("facing").map(String::as_str) {
+        Some("south") => 180.0,
+        Some("west") => 270.0,
+        Some("east") => 90.0,
+        _ => 0.0,
+    }
+}
+
 pub fn block_quads_stated<'a>(
     wx: i32,
     wy: i32,
@@ -115,12 +130,40 @@ pub fn block_quads_stated<'a>(
     properties: &HashMap<String, String>,
     lookup: &impl Fn(i32, i32, i32) -> Option<&'a str>,
 ) -> Vec<BlockQuad> {
+    let short = strip_namespace(block_name);
+
+    // Blocks the game draws from code have no geometry in any model JSON, so
+    // parsing the assets finds nothing and they fall back to a plain cube --
+    // a chest as a featureless box, a bell as its bare mounting bar. Their
+    // shapes come from a transcribed table instead, and are *added to* the
+    // model's own boxes rather than replacing them, because a bell needs both
+    // the bar the model gives us and the bell the table does.
+    let mut extra = Vec::new();
+    if let Some(be) = crate::block_entity_models::block_entity_model(short) {
+        let props = |key: &str| properties.get(key).map(String::as_str);
+        for variant in be.variants {
+            if variant.matches(&props) {
+                extra.extend(model_quads(
+                    wx,
+                    wy,
+                    wz,
+                    block_name,
+                    variant.elements,
+                    0.0,
+                    block_entity_rotation(properties),
+                    lookup,
+                ));
+                break;
+            }
+        }
+    }
+
     // Blocks with a real (non-cube) model draw their own boxes. Without this
     // the block id was ignored outright and everything became a cube, which
     // is why plants, carpets and clusters all came out as solid blocks.
-    if let Some(model) = model_for(strip_namespace(block_name)) {
+    if let Some(model) = model_for(short) {
         let props = |key: &str| properties.get(key).map(String::as_str);
-        let mut quads = Vec::new();
+        let mut quads = std::mem::take(&mut extra);
         for variant in model.variants {
             if !variant.matches(&props) {
                 continue;
@@ -147,6 +190,13 @@ pub fn block_quads_stated<'a>(
         }
         // No variant matched (unexpected state) — fall through to a cube
         // rather than emitting nothing and leaving a hole in the world.
+    }
+
+    // A code-drawn block with no model JSON at all -- a chest, a conduit, a
+    // decorated pot. The transcribed boxes are the whole block, and without
+    // this they would be thrown away for the cube fallback below.
+    if !extra.is_empty() {
+        return extra;
     }
 
     let mut quads = Vec::with_capacity(6);

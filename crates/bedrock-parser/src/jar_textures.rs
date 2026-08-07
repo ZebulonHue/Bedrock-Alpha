@@ -16,6 +16,14 @@ use std::path::{Path, PathBuf};
 
 const BLOCK_PREFIX: &str = "assets/minecraft/textures/block/";
 
+/// Textures for things the game draws in code rather than from a model:
+/// chests, bells, shulker boxes, banners, conduits, decorated pots.
+///
+/// Kept under their `entity/...` path as the key, because the names collide
+/// with block textures otherwise -- `entity/chest/normal` against nothing, but
+/// `entity/conduit/base` against plenty of `base`-suffixed block textures.
+const ENTITY_PREFIX: &str = "assets/minecraft/textures/entity/";
+
 /// In-memory store of block texture PNGs, keyed by texture name.
 ///
 /// Example key: `"grass_block_top"` (no path prefix, no `.png`).
@@ -112,7 +120,7 @@ impl JarTextureLoader {
         for i in 0..archive.len() {
             let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
             let name = entry.name().to_owned();
-            if !name.starts_with(BLOCK_PREFIX) {
+            if !name.starts_with(BLOCK_PREFIX) && !name.starts_with(ENTITY_PREFIX) {
                 continue;
             }
             let (target, suffix) = if name.ends_with(".png") {
@@ -122,13 +130,21 @@ impl JarTextureLoader {
             } else {
                 continue;
             };
-            // Strip prefix and suffix to get the texture name.
-            let texture_name = &name[BLOCK_PREFIX.len()..name.len() - suffix.len()];
+            // Strip prefix and suffix to get the texture name. Entity textures
+            // keep an `entity/` prefix so they cannot collide with block ones.
+            let texture_name = if name.starts_with(BLOCK_PREFIX) {
+                name[BLOCK_PREFIX.len()..name.len() - suffix.len()].to_owned()
+            } else {
+                format!(
+                    "entity/{}",
+                    &name[ENTITY_PREFIX.len()..name.len() - suffix.len()]
+                )
+            };
             let mut bytes = Vec::with_capacity(entry.size() as usize);
             entry
                 .read_to_end(&mut bytes)
                 .map_err(|e| format!("Cannot read texture {name}: {e}"))?;
-            target.insert(texture_name.to_owned(), bytes);
+            target.insert(texture_name, bytes);
         }
 
         if textures.is_empty() {

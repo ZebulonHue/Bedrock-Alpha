@@ -14,6 +14,7 @@ pub mod bedrock;
 /// Mineways gBlockDefinitions derived data (auto-generated from blockInfo.cpp).
 pub mod block_definitions;
 /// Per-face texture resolution for vanilla blocks.
+pub mod block_entity_models;
 pub mod block_model;
 /// Per-block-type geometry generation (like Mineways' gBlockDefinitions[]).
 pub mod block_models;

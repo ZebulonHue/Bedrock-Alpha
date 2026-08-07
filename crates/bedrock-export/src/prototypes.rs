@@ -152,8 +152,8 @@ pub fn write_block_prototypes(
             );
             materials.push((texture.clone(), cutout));
 
-            let _ = writeln!(obj, "o {stem}_{texture}");
-            let _ = writeln!(obj, "usemtl {texture}");
+            let _ = writeln!(obj, "o {stem}_{}", texture_stem(texture));
+            let _ = writeln!(obj, "usemtl {}", texture_stem(texture));
             for quad in group {
                 for corner in &quad.corners {
                     let _ = writeln!(
@@ -208,6 +208,10 @@ pub fn write_block_prototypes(
         if let Ok(mtl) = std::fs::File::create(&mtl_file) {
             let mut mtl = BufWriter::new(mtl);
             for (texture, cutout) in &materials {
+                // `translucency` keys off the real texture name, so read it
+                // before flattening the name down to a filename.
+                let dissolve = translucency(texture);
+                let texture = texture_stem(texture);
                 let _ = writeln!(mtl, "\nnewmtl {texture}");
                 let _ = writeln!(mtl, "Ka 0.0000 0.0000 0.0000");
                 let _ = writeln!(mtl, "Kd 1.0000 1.0000 1.0000");
@@ -217,7 +221,6 @@ pub fn write_block_prototypes(
                 // than per-pixel, which no amount of cutout alpha expresses:
                 // without a dissolve they read as solid slabs, and an ocean
                 // covering most of a world hides everything under it.
-                let dissolve = translucency(texture);
                 let _ = writeln!(
                     mtl,
                     "illum {}",
@@ -316,6 +319,16 @@ fn translucency(texture: &str) -> Option<f32> {
 /// draw time. Writing those out untouched is what makes canopies and grass
 /// render as white or grey patches, so the same tint the atlas builder bakes
 /// in is applied here.
+/// A texture name as a bare filename.
+///
+/// Entity textures keep their path in the name -- `entity/chest/normal` -- so
+/// that they cannot collide with block textures. That path cannot be a
+/// filename, and an OBJ material name with slashes in it is asking for
+/// trouble, so both flatten to the same stem.
+fn texture_stem(name: &str) -> String {
+    name.replace('/', "_")
+}
+
 fn extract_texture(
     loader: &JarTextureLoader,
     name: &str,
@@ -353,7 +366,7 @@ fn extract_texture(
             .or_else(|| bedrock_parser::texture::biome_tint(name));
         let tinted = tint.and_then(|tint| tint_png(&png, tint));
         let _ = std::fs::write(
-            dir.join(format!("{name}.png")),
+            dir.join(format!("{}.png", texture_stem(name))),
             tinted.as_deref().unwrap_or(&png),
         );
     }
