@@ -69,6 +69,15 @@ pub fn write_block_prototypes(
         return stats;
     }
 
+    // Clear what a previous run left here. Writing only the files this export
+    // needs leaves the rest untouched and years out of date: a re-export after
+    // a texture change kept `stonecutter_saw` frozen on frame one, because the
+    // run that wrote it predated animation support and nothing overwrote it.
+    // Only the generated file types go, so anything a user parked in the
+    // folder survives.
+    clear_generated(&dir, &["obj", "mtl"]);
+    clear_generated(&texture_dir, &["png", "json"]);
+
     let loader = match JarTextureLoader::load() {
         Ok(loader) => loader,
         Err(err) => {
@@ -338,6 +347,26 @@ fn extract_texture(
         );
     }
     has_alpha(&png)
+}
+
+/// Delete this exporter's own output from a directory, leaving anything else.
+///
+/// Matching on extension rather than emptying the folder means a stray note or
+/// a hand-made override someone dropped in is not destroyed by a re-export.
+fn clear_generated(dir: &Path, extensions: &[&str]) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let matches = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| extensions.iter().any(|want| e.eq_ignore_ascii_case(want)));
+        if matches && path.is_file() {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 /// Read a texture's animation, if it has one.
