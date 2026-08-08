@@ -15,6 +15,8 @@
 #endif
 
 #define AppName "Project Bedrock"
+#define AppPublisher "ZebulonHue"
+#define AppUrl "https://github.com/ZebulonHue/Bedrock-Alpha"
 ; The shipped name, which is what the user sees and double-clicks.
 ; The build output keeps cargo's name; it is renamed on the way in.
 #define AppExe "Project Bedrock.exe"
@@ -26,6 +28,12 @@ AppId={{8C2F1E4A-9B3D-4A7E-8F21-5D6C0B9E4A11}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppVerName={#AppName} {#AppVersion}
+; Without these, Add/Remove Programs shows the app with a blank publisher and
+; no support link, which is exactly how unwanted software presents itself.
+AppPublisher={#AppPublisher}
+AppPublisherURL={#AppUrl}
+AppSupportURL={#AppUrl}/issues
+AppUpdatesURL={#AppUrl}/releases
 DefaultDirName={autopf}\{#AppName}
 DefaultGroupName={#AppName}
 UninstallDisplayIcon={app}\{#AppExe}
