@@ -304,7 +304,7 @@ static B2J_MAP: std::sync::OnceLock<std::collections::HashMap<String, String>> =
 fn get_b2j_map() -> &'static std::collections::HashMap<String, String> {
     B2J_MAP.get_or_init(|| {
         let json_str =
-            include_str!("../../../third_party/minecraft-data/data/bedrock/1.26.20/blocksB2J.json");
+            include_str!("../data/bedrock_blocks_b2j.json");
         serde_json::from_str(json_str).unwrap_or_default()
     })
 }
