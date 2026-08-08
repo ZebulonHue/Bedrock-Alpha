@@ -15,7 +15,10 @@
 #endif
 
 #define AppName "Project Bedrock"
-#define AppExe "project-bedrock.exe"
+; The shipped name, which is what the user sees and double-clicks.
+; The build output keeps cargo's name; it is renamed on the way in.
+#define AppExe "Project Bedrock.exe"
+#define BuiltExe "project-bedrock.exe"
 #define AddonFile "project_bedrock_import_tools.py"
 
 [Setup]

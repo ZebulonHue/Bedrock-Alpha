@@ -1,0 +1,50 @@
+Project Bedrock
+===============
+
+Get a Minecraft world into Blender looking like the game.
+
+
+RUNNING IT
+----------
+
+Double-click "Project Bedrock.exe".
+
+That is the whole app. Nothing to install, nothing else to download.
+
+Windows may show a blue "Windows protected your PC" box the first time,
+because the app is not code-signed. Click "More info" then "Run anyway".
+It appears once. There is no admin prompt and nothing is written outside
+your own user folder.
+
+
+GETTING EXPORTS INTO BLENDER
+----------------------------
+
+1. In Project Bedrock, open a world, choose an area, and export it.
+
+2. In Blender: Edit > Preferences > Add-ons > Install, and pick
+
+       Blender Add-on\project_bedrock_import_tools.py
+
+   from this folder. Tick the box next to it to enable it.
+
+3. In Blender: File > Import > Project Bedrock, and choose the .obj
+   this app wrote.
+
+The add-on will use MCprep's assets if you have MCprep installed, which
+gives better-looking plants, mobs and torches. It works without it.
+
+
+NOTES
+-----
+
+The first export downloads about 25 MB of Minecraft's own block textures
+from Mojang, unless you already have Minecraft installed, in which case it
+reads them from there.
+
+Close Project Bedrock before re-importing in Blender -- while it is open it
+holds the export folder and some files cannot be rewritten.
+
+
+Source, issues and newer builds:
+https://github.com/ZebulonHue/Bedrock-Alpha

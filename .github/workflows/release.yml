@@ -62,11 +62,13 @@ jobs:
       - name: Build portable zip
         shell: pwsh
         run: |
-          $stage = "dist/portable/ProjectBedrock"
+          $stage = "dist/portable/Project Bedrock"
           New-Item -ItemType Directory -Force -Path "$stage/Blender Add-on" | Out-Null
-          Copy-Item target/release/project-bedrock.exe $stage
+          # Shipped under the name the user actually double-clicks.
+          Copy-Item target/release/project-bedrock.exe "$stage/Project Bedrock.exe"
           Copy-Item project_bedrock_import_tools.py "$stage/Blender Add-on"
           Copy-Item README.md $stage
+          Copy-Item installer/START-HERE.txt $stage
           Compress-Archive -Path $stage -DestinationPath "dist/ProjectBedrock-${{ steps.version.outputs.value }}-portable.zip" -Force
 
       - name: Upload build artifacts
