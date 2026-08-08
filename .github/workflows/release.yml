@@ -53,6 +53,11 @@ jobs:
             echo "value=0.0.0-dev" >> "$GITHUB_OUTPUT"
           fi
 
+      # Inno Setup reports a missing Source: only once it runs, which is
+      # otherwise eight minutes into the build. Fail on it immediately.
+      - name: Check installer sources
+        run: python tools/check_installer.py
+
       # Inno Setup ships on the windows-latest image, so there is nothing to
       # install here.
       - name: Build installer

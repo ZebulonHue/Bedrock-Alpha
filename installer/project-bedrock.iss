@@ -49,7 +49,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Shortcuts:"
 
 [Files]
-Source: "..\target\release\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\target\release\{#BuiltExe}"; DestDir: "{app}"; DestName: "{#AppExe}"; Flags: ignoreversion
 Source: "..\{#AddonFile}"; DestDir: "{app}\Blender Add-on"; Flags: ignoreversion
 Source: "..\README.md"; DestDir: "{app}"; DestName: "README.md"; Flags: ignoreversion
 
