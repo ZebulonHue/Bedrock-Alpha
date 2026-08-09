@@ -101,7 +101,9 @@ jobs:
             dist/*.exe
             dist/*.zip
             dist/*.py
-          generate_release_notes: true
+          # Deliberately not generate_release_notes: a list of commit
+          # subjects tells a downloader nothing about which file they want.
+          # The changelog is linked from the body instead.
           # Spelled out because this is two pieces -- a Windows app and a
           # Blender add-on -- and a page listing only file names leaves
           # someone guessing which they need and what to do with them.
@@ -152,3 +154,7 @@ jobs:
             Blocks otherwise carry their real geometry, including the shapes
             the game draws in code (bells, chests, shulker boxes, banners,
             conduits), and animated textures play.
+
+            ---
+
+            [Full changelog](https://github.com/ZebulonHue/Bedrock-Alpha/commits/v${{ steps.version.outputs.value }})
