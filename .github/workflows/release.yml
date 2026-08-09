@@ -92,6 +92,24 @@ jobs:
             dist/*.zip
             dist/*.py
 
+      # A release outlives its tag, and the publish step below will not
+      # rewrite the notes of one that already exists -- so re-cutting a tag
+      # updated the files while leaving stale text above them. Clearing it
+      # first means the notes always match the build.
+      - name: Clear any existing release for this tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release delete "$tag" --yes
+            echo "deleted the existing $tag release"
+          else
+            echo "no existing $tag release"
+          fi
+
       - name: Publish release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
