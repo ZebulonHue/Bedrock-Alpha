@@ -124,11 +124,23 @@ impl<S: tracing::Subscriber> Layer<S> for BufferLayer {
     }
 }
 
-/// Install the global tracing subscriber. Events at INFO and above are kept;
-/// the log file is truncated on every launch. Call once, early in `main`.
+/// Install the global tracing subscriber. Events at INFO and above are kept.
+/// Call once, early in `main`.
+///
+/// The previous run's log is kept alongside as `<name>.old.<ext>`. Truncating
+/// on launch alone destroyed the one thing worth having: after a crash the
+/// natural thing to do is start the app again and go looking for the log, and
+/// that act wiped it. A tester reporting "it crashes and I can't get you the
+/// log" was describing exactly that.
 pub fn init(buffer: LogBuffer, log_file: &Path) {
     if let Some(parent) = log_file.parent() {
         let _ = std::fs::create_dir_all(parent);
+    }
+    if log_file.exists() {
+        let stem = log_file.file_stem().unwrap_or_default().to_string_lossy();
+        let ext = log_file.extension().unwrap_or_default().to_string_lossy();
+        let previous = log_file.with_file_name(format!("{stem}.old.{ext}"));
+        let _ = std::fs::rename(log_file, previous);
     }
     let layer = BufferLayer {
         buffer,

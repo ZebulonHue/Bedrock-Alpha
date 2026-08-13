@@ -149,7 +149,26 @@ impl BedrockApp {
             render_state.renderer.write().callback_resources.insert(
                 bedrock_render::ViewportRenderer::new(render_state, Arc::clone(&scene)),
             );
-            tracing::info!("WGPU render state acquired — viewport renderer initialized");
+            // Without a handler wgpu's default is to panic, and a graphics
+            // driver refusing an allocation is not a bug to abort on -- it is
+            // a large world on a small card, which is most of the audience.
+            // A tester on a 50 GB save reported an instant crash with nothing
+            // in the log; a device error is exactly what leaves no trace.
+            render_state
+                .device
+                .on_uncaptured_error(Arc::new(|error| match error {
+                    eframe::wgpu::Error::OutOfMemory { .. } => tracing::error!(
+                        "The graphics card ran out of memory drawing this world.                          Lower the load radius in Settings and reopen the world."
+                    ),
+                    other => tracing::error!("Graphics error: {other}"),
+                }));
+            let info = render_state.adapter.get_info();
+            tracing::info!(
+                "WGPU render state acquired — viewport renderer initialized                  (adapter: {}, {:?}, backend {:?})",
+                info.name,
+                info.device_type,
+                info.backend
+            );
         } else {
             tracing::warn!("No WGPU render state available — the viewport will be empty");
         }
