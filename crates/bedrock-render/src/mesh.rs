@@ -9,6 +9,7 @@ use bedrock_parser::chunk::Chunk;
 use bedrock_parser::java_simple::ExteriorWorld;
 use bedrock_parser::texture::FaceAwareTileSet;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Unique identifier for a chunk within a world.
 pub type ChunkId = (i32, i32);
@@ -203,6 +204,38 @@ where
 /// For large worlds, chunks are meshed in parallel using scoped threads
 /// (no external dependencies required).
 pub fn chunks_to_meshes(chunks: &[Chunk], tiles: &FaceAwareTileSet) -> Vec<ChunkMesh> {
+    mesh_within_budget(chunks, tiles, MAX_MESH_BYTES).0
+}
+
+/// Bytes one mesh occupies in memory, by the same reckoning the uploader uses.
+fn mesh_bytes(mesh: &ChunkMesh) -> u64 {
+    (mesh.vertices.len() * size_of::<Vertex>() + mesh.indices.len() * size_of::<u32>()) as u64
+}
+
+/// Ceiling on chunk geometry held in memory while loading a world.
+///
+/// The renderer will not upload more than a gigabyte of it, so meshing much
+/// past that is work whose only result is memory pressure. A 74 MB world at
+/// radius 48 meshed 128 million vertices -- 4.9 GB -- and then had 4,732 of
+/// its 7,826 chunks dropped at upload for exceeding the GPU budget. On a world
+/// with thousands of chunks of dense building, that overshoot is enough to
+/// exhaust memory and take the process with it.
+///
+/// Set above the GPU budget rather than equal to it: the two order chunks
+/// slightly differently (load centre against camera position), so a little
+/// slack keeps the renderer's own choice from being pre-empted here.
+pub const MAX_MESH_BYTES: u64 = 1536 * 1024 * 1024;
+
+/// Mesh chunks until `budget` bytes of geometry exist, and report the rest.
+///
+/// Chunks arrive nearest-first, so what survives a tight budget is the middle
+/// of the loaded area rather than whichever corner the mesher reached first.
+/// Returns the meshes and how many chunks were left unmeshed.
+pub fn mesh_within_budget(
+    chunks: &[Chunk],
+    tiles: &FaceAwareTileSet,
+    budget: u64,
+) -> (Vec<ChunkMesh>, usize) {
     let by_coord: HashMap<(i32, i32), &Chunk> = chunks.iter().map(|c| ((c.x, c.z), c)).collect();
 
     // Sequential path: avoids thread overhead for small workloads and
@@ -214,10 +247,13 @@ pub fn chunks_to_meshes(chunks: &[Chunk], tiles: &FaceAwareTileSet) -> Vec<Chunk
             let chunk = by_coord.get(&(cx, cz))?;
             chunk.block_at(wx.rem_euclid(16) as usize, y, wz.rem_euclid(16) as usize)
         };
-        return chunks
-            .iter()
-            .filter_map(|chunk| mesh_one_chunk(chunk, &lookup, tiles))
-            .collect();
+        return (
+            chunks
+                .iter()
+                .filter_map(|chunk| mesh_one_chunk(chunk, &lookup, tiles))
+                .collect(),
+            0,
+        );
     }
 
     // Parallel path: divide into batches, mesh each batch in its own thread.
@@ -226,12 +262,22 @@ pub fn chunks_to_meshes(chunks: &[Chunk], tiles: &FaceAwareTileSet) -> Vec<Chunk
         .unwrap_or(4);
     let batch_size = chunks.len().div_ceil(num_threads);
 
-    std::thread::scope(|s| {
+    // Shared across the workers so the budget is a total, not a per-thread
+    // allowance -- eight threads each stopping at the full budget would use
+    // eight times it, which is the very thing being prevented.
+    let used = AtomicU64::new(0);
+    let abandoned = AtomicUsize::new(0);
+
+    let meshes: Vec<ChunkMesh> = std::thread::scope(|s| {
         let mut results: Vec<std::thread::ScopedJoinHandle<'_, Vec<ChunkMesh>>> =
             Vec::with_capacity(num_threads);
 
         for batch in chunks.chunks(batch_size) {
-            results.push(s.spawn(|| {
+            let used = &used;
+            let abandoned = &abandoned;
+            // Borrowed, not moved: every worker reads the same table.
+            let by_coord = &by_coord;
+            results.push(s.spawn(move || {
                 // Each thread builds its own lookup closure borrowing from the
                 // parent scope's `by_coord` table (read-only, safe to share).
                 let lookup = |wx: i32, y: i32, wz: i32| -> Option<&str> {
@@ -240,10 +286,20 @@ pub fn chunks_to_meshes(chunks: &[Chunk], tiles: &FaceAwareTileSet) -> Vec<Chunk
                     let chunk = by_coord.get(&(cx, cz))?;
                     chunk.block_at(wx.rem_euclid(16) as usize, y, wz.rem_euclid(16) as usize)
                 };
-                batch
-                    .iter()
-                    .filter_map(|chunk| mesh_one_chunk(chunk, &lookup, tiles))
-                    .collect::<Vec<_>>()
+                let mut out = Vec::new();
+                for chunk in batch {
+                    // Checked before meshing so the budget cannot be exceeded
+                    // by a whole chunk's worth of geometry.
+                    if used.load(Ordering::Relaxed) >= budget {
+                        abandoned.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    if let Some(mesh) = mesh_one_chunk(chunk, &lookup, tiles) {
+                        used.fetch_add(mesh_bytes(&mesh), Ordering::Relaxed);
+                        out.push(mesh);
+                    }
+                }
+                out
             }));
         }
 
@@ -252,7 +308,17 @@ pub fn chunks_to_meshes(chunks: &[Chunk], tiles: &FaceAwareTileSet) -> Vec<Chunk
             .flat_map(|h| h.join())
             .flatten()
             .collect()
-    })
+    });
+
+    let skipped = abandoned.load(Ordering::Relaxed);
+    if skipped > 0 {
+        tracing::warn!(
+            "Mesh memory budget reached ({} MiB): {} chunk(s) not built.              Lower the load radius in Settings to see a smaller area in full.",
+            budget / (1024 * 1024),
+            skipped
+        );
+    }
+    (meshes, skipped)
 }
 
 /// Build one face-culled mesh from a set of chunks, textured from `tiles`.
@@ -366,4 +432,59 @@ pub fn mesh_exterior_world(world: &ExteriorWorld, tiles: &FaceAwareTileSet) -> V
 #[cfg(test)]
 mod tests {
     // Face winding is verified by block_shape's own tests.
+    use super::*;
+    use bedrock_parser::chunk::{BlockState, SectionData};
+    use bedrock_parser::jar_textures::JarTextureLoader;
+
+    /// A chunk of solid stone, which meshes to a full shell of faces.
+    fn stone_chunk(x: i32, z: i32) -> Chunk {
+        let sections = (0..4)
+            .map(|y| SectionData {
+                y,
+                palette: vec![BlockState::new("minecraft:stone")],
+                indices: Vec::new(),
+            })
+            .collect();
+        Chunk::from_sections(x, z, sections)
+    }
+
+    fn stone_tiles() -> FaceAwareTileSet {
+        FaceAwareTileSet::build(["minecraft:stone".to_owned()], &JarTextureLoader::empty())
+    }
+
+    #[test]
+    fn meshing_stops_at_the_memory_budget() {
+        // Enough chunks to take the parallel path, so the shared counter is
+        // what is under test rather than a single thread's own tally.
+        let chunks: Vec<Chunk> = (0..64).map(|i| stone_chunk(i % 8, i / 8)).collect();
+        let tiles = stone_tiles();
+
+        let (all, none_skipped) = mesh_within_budget(&chunks, &tiles, u64::MAX);
+        assert_eq!(none_skipped, 0, "an unlimited budget should skip nothing");
+        let full: u64 = all.iter().map(mesh_bytes).sum();
+        assert!(full > 0, "solid stone chunks must produce geometry");
+
+        // A budget of a quarter should stop early and say so.
+        let budget = full / 4;
+        let (limited, skipped) = mesh_within_budget(&chunks, &tiles, budget);
+        assert!(skipped > 0, "a quarter budget should abandon chunks");
+        assert_eq!(
+            limited.len() + skipped,
+            all.len(),
+            "every chunk is either meshed or counted as skipped"
+        );
+
+        // The point of the budget: memory actually stays near it. Workers
+        // check before meshing, so the overshoot is bounded by one chunk per
+        // thread rather than by the size of the world.
+        let used: u64 = limited.iter().map(mesh_bytes).sum();
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4) as u64;
+        let largest = all.iter().map(mesh_bytes).max().unwrap_or(0);
+        assert!(
+            used <= budget + largest * threads,
+            "used {used} bytes against a budget of {budget}"
+        );
+    }
 }

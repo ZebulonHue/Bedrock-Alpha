@@ -256,6 +256,15 @@ fn finish_active_loading(
         ));
     }
 
+    // Nearest the load centre first, because meshing stops at a memory budget
+    // and what survives should be the area around the player rather than
+    // whichever corner of the region files happened to be read first.
+    let mut chunks = chunks;
+    chunks.sort_by_key(|c| {
+        let (dx, dz) = ((c.x - center_x) as i64, (c.z - center_z) as i64);
+        dx * dx + dz * dz
+    });
+
     let block_names: Vec<String> = chunks
         .iter()
         .flat_map(|c| c.block_names().into_iter().map(str::to_owned))
