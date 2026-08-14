@@ -172,6 +172,7 @@ fn load_java_active(
     let min_rz = (center_z - radius_chunks).div_euclid(32);
     let max_rz = (center_z + radius_chunks).div_euclid(32);
 
+    let world_dimensions = world.dimensions();
     let mut chunks: Vec<Chunk> = Vec::new();
     let mut per_dim: HashMap<i32, usize> = HashMap::new();
     for (rx, rz, path) in world.regions() {
@@ -198,24 +199,27 @@ fn load_java_active(
         }
         *per_dim.entry(dim).or_insert(0) += dim_count;
     }
-    // Log per-dimension loading summary.
-    let dim_desc: Vec<String> = per_dim
-        .iter()
-        .map(|(d, c)| {
-            let label = match *d {
-                0 => "Overworld".into(),
-                1 => "End".into(),
-                -1 => "Nether".into(),
-                k => format!("DIM{k}"),
-            };
-            format!("{label}: {c} chunks")
-        })
-        .collect();
-    tracing::info!(
-        "Loaded {} chunks from dimension(s): {}",
-        chunks.len(),
-        dim_desc.join(", ")
-    );
+    // Which dimension was opened, and what else the save holds. The old
+    // message counted per `DIM<n>` folder, which the modern
+    // `dimensions/<namespace>/<name>` layout has none of -- so a save loading
+    // its overworld, Nether and End all at once reported them as one number
+    // under "Overworld" and hid the fact entirely.
+    let dimensions = world_dimensions;
+    let opened = dimensions
+        .first()
+        .map(|d| d.kind.label())
+        .unwrap_or_else(|| "unknown".to_owned());
+    let others: Vec<String> = dimensions.iter().skip(1).map(|d| d.kind.label()).collect();
+    if others.is_empty() {
+        tracing::info!("Loaded {} chunks from the {opened}", chunks.len());
+    } else {
+        tracing::info!(
+            "Loaded {} chunks from the {opened} (this save also has: {})",
+            chunks.len(),
+            others.join(", ")
+        );
+    }
+    let _ = &per_dim;
     finish_active_loading(
         &summary.name,
         WorldHandle::Java(world),

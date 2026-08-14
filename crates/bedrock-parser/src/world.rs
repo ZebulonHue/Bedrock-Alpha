@@ -26,23 +26,16 @@ impl World {
         level::read_level_dat(&self.folder.join("level.dat"))
     }
 
-    /// `(region_x, region_z, path)` for every region file across the overworld
-    /// and all dimension folders: the legacy `DIM1` (End) / `DIM-1` (Nether) /
-    /// `DIM<n>` (custom) layout, and the modern `dimensions/<namespace>/<name>`
-    /// layout (1.16+ custom dimensions — and, on at least one real-world save
-    /// seen in the wild, used for the overworld itself instead of the
-    /// top-level `region/` folder). Scanning all of these is what lets worlds
-    /// whose chunks live outside the conventional top-level `region/` — for
-    /// example an End-only save under `DIM1/region/`, or a save whose
-    /// overworld itself lives under `dimensions/minecraft/overworld/region/`
-    /// — actually load.
-    pub fn regions(&self) -> Vec<(i32, i32, PathBuf)> {
-        let mut regions = Vec::new();
-
-        // Candidate dimension roots: the world folder (overworld) plus any
-        // `DIM<n>` directory (e.g. `DIM1`, `DIM-1`), plus every
-        // `dimensions/<namespace>/<name>` directory.
-        let mut roots = vec![self.folder.clone()];
+    /// Every dimension in this save that actually holds region files.
+    ///
+    /// Covers the legacy `DIM1` (End) / `DIM-1` (Nether) / `DIM<n>` layout and
+    /// the modern `dimensions/<namespace>/<name>` one, plus the top-level
+    /// `region/`. Some saves keep even the overworld under `dimensions/`
+    /// rather than at the top level, so neither location can be assumed.
+    ///
+    /// Returned in preference order, most likely to be the overworld first.
+    pub fn dimensions(&self) -> Vec<Dimension> {
+        let mut roots = vec![(DimensionKind::Overworld, self.folder.clone())];
         if let Ok(entries) = std::fs::read_dir(&self.folder) {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -53,8 +46,8 @@ impl World {
                     continue;
                 };
                 if let Some(rest) = name.strip_prefix("DIM") {
-                    if rest.parse::<i32>().is_ok() {
-                        roots.push(path);
+                    if let Ok(id) = rest.parse::<i32>() {
+                        roots.push((DimensionKind::Legacy(id), path));
                     }
                 }
             }
@@ -70,29 +63,103 @@ impl World {
                 };
                 for name_entry in names.flatten() {
                     let name_path = name_entry.path();
-                    if name_path.is_dir() {
-                        roots.push(name_path);
+                    if !name_path.is_dir() {
+                        continue;
                     }
+                    let label = name_path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or_default()
+                        .to_owned();
+                    roots.push((DimensionKind::Named(label), name_path));
                 }
             }
         }
 
-        for root in roots {
-            let region_dir = root.join("region");
-            let Ok(entries) = std::fs::read_dir(&region_dir) else {
+        let mut found: Vec<Dimension> = Vec::new();
+        for (kind, root) in roots {
+            let Ok(entries) = std::fs::read_dir(root.join("region")) else {
                 continue;
             };
+            let mut regions: Vec<(i32, i32, PathBuf)> = Vec::new();
             for entry in entries.flatten() {
                 let path = entry.path();
                 if let Some((x, z)) = region_coordinates(&path) {
                     regions.push((x, z, path));
                 }
             }
+            if regions.is_empty() {
+                continue;
+            }
+            regions.sort_unstable();
+            found.push(Dimension { kind, regions });
         }
-
-        regions.sort_unstable();
-        regions
+        found.sort_by_key(|d| d.kind.rank());
+        found
     }
+
+    /// `(region_x, region_z, path)` for the dimension this world opens in.
+    ///
+    /// One dimension only. Every dimension covers the same X/Z, so returning
+    /// all of them stacks the Nether and the End on top of the overworld at
+    /// identical coordinates -- geometry that overlaps in space, cannot be
+    /// told apart afterwards because a chunk is keyed by X/Z alone, and costs
+    /// its full price to build. A save with a well-explored Nether meshed 3,293
+    /// chunks for a radius that can only hold 1,369, at 42 GB of vertices.
+    ///
+    /// Falls through to whichever dimension does have regions, so a save whose
+    /// chunks live only under `DIM1/region/` or
+    /// `dimensions/minecraft/overworld/region/` still opens.
+    pub fn regions(&self) -> Vec<(i32, i32, PathBuf)> {
+        self.dimensions()
+            .into_iter()
+            .next()
+            .map(|d| d.regions)
+            .unwrap_or_default()
+    }
+}
+
+/// Which dimension a set of region files belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DimensionKind {
+    /// The save's top-level `region/`.
+    Overworld,
+    /// A `DIM<n>` folder: 1 is the End, -1 the Nether.
+    Legacy(i32),
+    /// A `dimensions/<namespace>/<name>` folder, by its name.
+    Named(String),
+}
+
+impl DimensionKind {
+    /// Sort key placing the most overworld-like first.
+    fn rank(&self) -> (u8, String) {
+        match self {
+            DimensionKind::Overworld => (0, String::new()),
+            DimensionKind::Named(name) if name == "overworld" => (1, name.clone()),
+            DimensionKind::Named(name) => (3, name.clone()),
+            DimensionKind::Legacy(id) => (4, id.to_string()),
+        }
+    }
+
+    /// Human-readable name for logs.
+    pub fn label(&self) -> String {
+        match self {
+            DimensionKind::Overworld => "Overworld".to_owned(),
+            DimensionKind::Legacy(1) => "End".to_owned(),
+            DimensionKind::Legacy(-1) => "Nether".to_owned(),
+            DimensionKind::Legacy(id) => format!("DIM{id}"),
+            DimensionKind::Named(name) => name.clone(),
+        }
+    }
+}
+
+/// One dimension's region files.
+#[derive(Debug, Clone)]
+pub struct Dimension {
+    /// Which dimension this is.
+    pub kind: DimensionKind,
+    /// `(region_x, region_z, path)`, sorted.
+    pub regions: Vec<(i32, i32, PathBuf)>,
 }
 
 /// Parse `r.X.Z.mca` filenames into region coordinates.
@@ -123,15 +190,49 @@ mod tests {
         std::fs::create_dir_all(dir.join("playerdata")).unwrap();
 
         let world = World::open(&dir);
-        let mut coords: Vec<(i32, i32)> = world
+
+        // All three are found, the overworld first. The order of the rest
+        // does not matter; only that the overworld wins.
+        let labels: Vec<String> = world.dimensions().iter().map(|d| d.kind.label()).collect();
+        assert_eq!(labels[0], "Overworld");
+        assert_eq!(labels.len(), 3);
+
+        // ...but opening the world uses one of them. Every dimension covers
+        // the same X/Z, so loading them together stacks the Nether and the End
+        // through the overworld at identical coordinates.
+        let coords: Vec<(i32, i32)> = world
             .regions()
             .into_iter()
             .map(|(x, z, _)| (x, z))
             .collect();
-        coords.sort_unstable();
-
-        assert_eq!(coords, vec![(0, 0), (0, 0), (2, -3)]);
+        assert_eq!(coords, vec![(0, 0)]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_save_without_a_top_level_region_folder_still_opens() {
+        // Both real cases: an End-only save, and a save that keeps its
+        // overworld under `dimensions/` instead of at the top level.
+        for (sub, expect) in [
+            (PathBuf::from("DIM1"), "End"),
+            (PathBuf::from("dimensions").join("minecraft").join("overworld"), "overworld"),
+        ] {
+            let dir = std::env::temp_dir()
+                .join(format!("bedrock-dim-only-{}-{expect}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join(&sub).join("region")).unwrap();
+            std::fs::write(dir.join(&sub).join("region").join("r.1.1.mca"), b"").unwrap();
+
+            let world = World::open(&dir);
+            let coords: Vec<(i32, i32)> = world
+                .regions()
+                .into_iter()
+                .map(|(x, z, _)| (x, z))
+                .collect();
+            assert_eq!(coords, vec![(1, 1)], "{expect} save must still open");
+            assert_eq!(world.dimensions()[0].kind.label(), expect);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     #[test]
