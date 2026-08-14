@@ -141,6 +141,24 @@ impl DimensionKind {
         }
     }
 
+    /// True when this is the Nether, under either folder layout.
+    pub fn is_nether(&self) -> bool {
+        matches!(self, DimensionKind::Legacy(-1))
+            || matches!(self, DimensionKind::Named(n) if n == "the_nether" || n == "nether")
+    }
+
+    /// True when this is the End, under either folder layout.
+    pub fn is_end(&self) -> bool {
+        matches!(self, DimensionKind::Legacy(1))
+            || matches!(self, DimensionKind::Named(n) if n == "the_end" || n == "end")
+    }
+
+    /// True when this is the overworld, under either folder layout.
+    pub fn is_overworld(&self) -> bool {
+        matches!(self, DimensionKind::Overworld)
+            || matches!(self, DimensionKind::Named(n) if n == "overworld")
+    }
+
     /// Human-readable name for logs.
     pub fn label(&self) -> String {
         match self {

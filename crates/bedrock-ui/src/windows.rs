@@ -1,6 +1,8 @@
 //! Floating windows: Settings and About.
 
-use bedrock_settings::{Settings, Theme, MAX_LOAD_RADIUS_CHUNKS, MIN_LOAD_RADIUS_CHUNKS};
+use bedrock_settings::{
+    DimensionChoice, Settings, Theme, MAX_LOAD_RADIUS_CHUNKS, MIN_LOAD_RADIUS_CHUNKS,
+};
 
 /// Show the Settings window. Returns `true` if the user asked to reset the
 /// dock layout (the app applies the reset, since it owns the dock state).
@@ -24,6 +26,18 @@ pub fn settings(ctx: &egui::Context, settings: &mut Settings, open: &mut bool) -
 
             ui.add_space(8.0);
             ui.heading("World Loading");
+            egui::ComboBox::from_label("Dimension")
+                .selected_text(settings.dimension.label())
+                .show_ui(ui, |ui| {
+                    for choice in DimensionChoice::ALL {
+                        ui.selectable_value(&mut settings.dimension, choice, choice.label());
+                    }
+                });
+            ui.weak(
+                "Which dimension to open. They all occupy the same coordinates,                  so only one can be shown at a time. A save only has the                  dimensions you have actually visited; if it lacks the one                  chosen, the world opens in whichever it does have.",
+            );
+
+            ui.add_space(4.0);
             ui.add(
                 egui::Slider::new(
                     &mut settings.load_radius_chunks,

@@ -12,7 +12,8 @@ use bedrock_parser::detect::{Edition, WorldSummary};
 use bedrock_parser::mineways::build_mineways_tileset;
 use bedrock_parser::region::RegionFile;
 use bedrock_parser::texture::FaceAwareTileSet;
-use bedrock_parser::world::World;
+use bedrock_parser::world::{Dimension, World};
+use bedrock_settings::DimensionChoice;
 use bedrock_render::math::Camera;
 use bedrock_render::mesh::{chunks_to_meshes, AtlasPixels, ChunkMesh};
 use std::collections::{HashMap, HashSet};
@@ -72,11 +73,43 @@ pub struct ActiveWorld {
 pub fn load_active_world(
     summary: &WorldSummary,
     radius_chunks: i32,
+    dimension: DimensionChoice,
 ) -> Result<(ActiveWorld, Vec<ChunkMesh>), String> {
     match summary.edition {
-        Edition::Java => load_java_active(summary, radius_chunks),
+        Edition::Java => load_java_active(summary, radius_chunks, dimension),
+        // The Bedrock reader decodes one dimension already.
         Edition::Bedrock => load_bedrock_active(summary, radius_chunks),
     }
+}
+
+/// Pick the dimension the user asked for, or say why it could not be used.
+///
+/// A save only has the dimensions the player has actually visited, so asking
+/// for the Nether of a world nobody has been to must not open an empty
+/// viewport with no explanation.
+fn choose_dimension(
+    dimensions: &[Dimension],
+    wanted: DimensionChoice,
+) -> Option<(&Dimension, Option<String>)> {
+    let matches = |d: &Dimension| match wanted {
+        DimensionChoice::Overworld => d.kind.is_overworld(),
+        DimensionChoice::Nether => d.kind.is_nether(),
+        DimensionChoice::End => d.kind.is_end(),
+    };
+    if let Some(found) = dimensions.iter().find(|d| matches(d)) {
+        return Some((found, None));
+    }
+    // Nothing matched: fall back rather than showing an empty world, and say
+    // so, because "I picked the Nether and got my base" needs an explanation.
+    let fallback = dimensions.first()?;
+    Some((
+        fallback,
+        Some(format!(
+            "This save has no {} — showing the {} instead.",
+            wanted.label(),
+            fallback.kind.label()
+        )),
+    ))
 }
 
 fn load_bedrock_active(
@@ -136,6 +169,7 @@ fn dim_from_path(path: &Path) -> i32 {
 fn load_java_active(
     summary: &WorldSummary,
     radius_chunks: i32,
+    dimension: DimensionChoice,
 ) -> Result<(ActiveWorld, Vec<ChunkMesh>), String> {
     let world = World::open(summary.folder.clone());
     // level.dat may be absent for standalone dimension folders (e.g. DIM1).
@@ -173,9 +207,21 @@ fn load_java_active(
     let max_rz = (center_z + radius_chunks).div_euclid(32);
 
     let world_dimensions = world.dimensions();
+    let Some((opened_dim, fallback_note)) = choose_dimension(&world_dimensions, dimension) else {
+        return Err(format!(
+            "No region files found in '{}' — the save has no generated chunks",
+            summary.name
+        ));
+    };
+    if let Some(note) = &fallback_note {
+        tracing::warn!("{note}");
+    }
+    let opened_label = opened_dim.kind.label();
+    let opened_regions = opened_dim.regions.clone();
+
     let mut chunks: Vec<Chunk> = Vec::new();
     let mut per_dim: HashMap<i32, usize> = HashMap::new();
-    for (rx, rz, path) in world.regions() {
+    for (rx, rz, path) in opened_regions {
         if rx < min_rx || rx > max_rx || rz < min_rz || rz > max_rz {
             continue;
         }
@@ -204,12 +250,12 @@ fn load_java_active(
     // `dimensions/<namespace>/<name>` layout has none of -- so a save loading
     // its overworld, Nether and End all at once reported them as one number
     // under "Overworld" and hid the fact entirely.
-    let dimensions = world_dimensions;
-    let opened = dimensions
-        .first()
+    let opened = opened_label;
+    let others: Vec<String> = world_dimensions
+        .iter()
         .map(|d| d.kind.label())
-        .unwrap_or_else(|| "unknown".to_owned());
-    let others: Vec<String> = dimensions.iter().skip(1).map(|d| d.kind.label()).collect();
+        .filter(|l| *l != opened)
+        .collect();
     if others.is_empty() {
         tracing::info!("Loaded {} chunks from the {opened}", chunks.len());
     } else {
@@ -452,4 +498,48 @@ pub fn load_chunks_for_region(
         max_z
     );
     chunks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bedrock_parser::world::DimensionKind;
+
+    fn dim(kind: DimensionKind) -> Dimension {
+        Dimension {
+            kind,
+            regions: vec![(0, 0, std::path::PathBuf::from("r.0.0.mca"))],
+        }
+    }
+
+    #[test]
+    fn the_chosen_dimension_wins_under_either_folder_layout() {
+        // Legacy DIM<n> and the modern dimensions/<ns>/<name> naming.
+        for nether in [
+            DimensionKind::Legacy(-1),
+            DimensionKind::Named("the_nether".into()),
+        ] {
+            let dims = vec![dim(DimensionKind::Overworld), dim(nether)];
+            let (chosen, note) = choose_dimension(&dims, DimensionChoice::Nether).unwrap();
+            assert!(chosen.kind.is_nether(), "{:?}", chosen.kind);
+            assert!(note.is_none(), "an exact match needs no explanation");
+        }
+    }
+
+    #[test]
+    fn asking_for_a_dimension_the_save_lacks_falls_back_and_says_so() {
+        // A save only holds the dimensions the player has visited, so this is
+        // the common case, not an edge one.
+        let dims = vec![dim(DimensionKind::Overworld)];
+        let (chosen, note) = choose_dimension(&dims, DimensionChoice::End).unwrap();
+        assert!(chosen.kind.is_overworld());
+        let note = note.expect("the substitution has to be explained");
+        assert!(note.contains("End"), "{note}");
+        assert!(note.contains("Overworld"), "{note}");
+    }
+
+    #[test]
+    fn a_save_with_no_regions_at_all_chooses_nothing() {
+        assert!(choose_dimension(&[], DimensionChoice::Overworld).is_none());
+    }
 }

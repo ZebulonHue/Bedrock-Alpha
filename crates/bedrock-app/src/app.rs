@@ -224,8 +224,9 @@ impl BedrockApp {
         self.loading_world = Some(summary.name.clone());
         let (tx, rx) = channel();
         let radius_chunks = self.settings.load_radius_chunks;
+        let dimension = self.settings.dimension;
         thread::spawn(move || {
-            let _ = tx.send(load_active_world(&summary, radius_chunks));
+            let _ = tx.send(load_active_world(&summary, radius_chunks, dimension));
         });
         self.world_rx = Some(rx);
     }

@@ -149,6 +149,41 @@ pub struct ExportPreferences {
     pub output_dir: String,
 }
 
+/// Which dimension of a save to open.
+///
+/// A save's dimensions all occupy the same X/Z, so they can only be viewed one
+/// at a time -- loading them together buries the overworld under the Nether at
+/// identical coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DimensionChoice {
+    /// The overworld, or whatever the save opens in if it has none.
+    #[default]
+    Overworld,
+    /// The Nether: `DIM-1`, or `dimensions/minecraft/the_nether`.
+    Nether,
+    /// The End: `DIM1`, or `dimensions/minecraft/the_end`.
+    End,
+}
+
+impl DimensionChoice {
+    /// Every choice, in menu order.
+    pub const ALL: [DimensionChoice; 3] = [
+        DimensionChoice::Overworld,
+        DimensionChoice::Nether,
+        DimensionChoice::End,
+    ];
+
+    /// Name shown in the UI.
+    pub fn label(self) -> &'static str {
+        match self {
+            DimensionChoice::Overworld => "Overworld",
+            DimensionChoice::Nether => "Nether",
+            DimensionChoice::End => "End",
+        }
+    }
+}
+
 /// Smallest allowed value for [`Settings::load_radius_chunks`].
 pub const MIN_LOAD_RADIUS_CHUNKS: i32 = 4;
 /// Largest allowed value for [`Settings::load_radius_chunks`]. Bounded to
@@ -194,6 +229,9 @@ pub struct Settings {
     /// world. Clamped to `[MIN_LOAD_RADIUS_CHUNKS, MAX_LOAD_RADIUS_CHUNKS]`
     /// on load in case a hand-edited or older settings file is out of range.
     pub load_radius_chunks: i32,
+
+    /// Which dimension to open a world in.
+    pub dimension: DimensionChoice,
     /// Debug visualisation settings (Phase 6b).
     pub debug: DebugSettings,
     /// A local video file to play, blurred, behind the UI, with its audio.
@@ -226,6 +264,7 @@ impl Default for Settings {
             recent_exports: Vec::new(),
             export: ExportPreferences::default(),
             load_radius_chunks: DEFAULT_LOAD_RADIUS_CHUNKS,
+            dimension: DimensionChoice::default(),
             debug: DebugSettings::default(),
             background_media_path: None,
             background_media_audio: true,
@@ -377,5 +416,32 @@ mod tests {
         let settings = Settings::load_from(&path);
         assert_eq!(settings.load_radius_chunks, MIN_LOAD_RADIUS_CHUNKS);
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_dimension_choice_survives_a_save_and_reload() {
+        let dir = std::env::temp_dir().join(format!("pb-dim-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("settings.toml");
+
+        // Written out in full, so a user editing the file by hand can see the
+        // key exists and what it takes.
+        let mut settings = Settings::default();
+        settings.dimension = DimensionChoice::Nether;
+        let text = toml::to_string_pretty(&settings).unwrap();
+        assert!(text.contains("dimension = \"nether\""), "{text}");
+
+        fs::write(&path, &text).unwrap();
+        let loaded = Settings::load_from(&path);
+        assert_eq!(loaded.dimension, DimensionChoice::Nether);
+
+        // A settings file written before this option existed must still load.
+        fs::write(&path, "load_radius_chunks = 12
+").unwrap();
+        assert_eq!(
+            Settings::load_from(&path).dimension,
+            DimensionChoice::Overworld
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }
